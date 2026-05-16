@@ -143,6 +143,34 @@ impl Model {
         crate::quant::dequantize_to_f32(t.dtype, self.tensor_bytes(t), &mut buf)?;
         Ok(buf)
     }
+
+    /// Dequantize a single "row" of a 2D tensor — i.e. one slice of length `shape[0]`
+    /// indexed along `shape[1]`. For an embedding table of GGUF shape `[hidden, vocab]`,
+    /// `dequantize_row(t, token_id)` returns that token's embedding vector without
+    /// touching the rest of the (potentially huge) table.
+    pub fn dequantize_row(&self, t: &TensorInfo, row: usize) -> Result<Vec<f32>> {
+        let (hidden, n_rows) = match t.shape.as_slice() {
+            [h, n] => (*h as usize, *n as usize),
+            other => bail!("dequantize_row needs a 2D tensor, got shape {:?}", other),
+        };
+        if row >= n_rows {
+            bail!("row {} out of bounds (tensor has {} rows along axis 1)", row, n_rows);
+        }
+        let block_elements = t.dtype.block_elements();
+        let block_bytes = t.dtype.block_bytes();
+        if hidden % block_elements != 0 {
+            bail!(
+                "row size {} not divisible by {:?} block size {} — can't slice on row boundary",
+                hidden, t.dtype, block_elements,
+            );
+        }
+        let row_bytes = hidden / block_elements * block_bytes;
+        let all = self.tensor_bytes(t);
+        let bytes = &all[row * row_bytes..(row + 1) * row_bytes];
+        let mut buf = vec![0.0_f32; hidden];
+        crate::quant::dequantize_to_f32(t.dtype, bytes, &mut buf)?;
+        Ok(buf)
+    }
 }
 
 fn parse(mmap: Mmap) -> Result<Model> {
