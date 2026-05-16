@@ -22,4 +22,5 @@ codegen-units = 1
 
 [dependencies]
 anyhow = "1.0.102"
+half = "2.7.1"
 memmap2 = "0.9.10"

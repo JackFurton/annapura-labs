@@ -2,5 +2,6 @@
 
 pub mod gguf;
 pub mod matmul;
+pub mod quant;
 
 pub use matmul::matmul_naive;

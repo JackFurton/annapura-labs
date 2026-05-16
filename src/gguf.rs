@@ -132,6 +132,17 @@ impl Model {
     pub fn arch(&self) -> Option<&str> {
         self.metadata.get("general.architecture").and_then(Value::as_str)
     }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Read a tensor's bytes and dequantize to a fresh `Vec<f32>`.
+    pub fn dequantize(&self, t: &TensorInfo) -> Result<Vec<f32>> {
+        let mut buf = vec![0.0_f32; t.n_elements() as usize];
+        crate::quant::dequantize_to_f32(t.dtype, self.tensor_bytes(t), &mut buf)?;
+        Ok(buf)
+    }
 }
 
 fn parse(mmap: Mmap) -> Result<Model> {
