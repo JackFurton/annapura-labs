@@ -39,6 +39,9 @@ impl Value {
             _ => None,
         }
     }
+    pub fn as_f32(&self) -> Option<f32> {
+        if let Value::F32(v) = self { Some(*v) } else { None }
+    }
     pub fn as_str(&self) -> Option<&str> {
         if let Value::String(s) = self { Some(s.as_str()) } else { None }
     }
