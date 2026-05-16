@@ -1,0 +1,21 @@
+[package]
+name = "annapura"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "From-scratch ML systems + accelerator co-design hack project"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "matmul"
+harness = false
+
+[profile.release]
+debug = true
+lto = "thin"
+codegen-units = 1
