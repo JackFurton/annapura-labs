@@ -19,3 +19,7 @@ harness = false
 debug = true
 lto = "thin"
 codegen-units = 1
+
+[dependencies]
+anyhow = "1.0.102"
+memmap2 = "0.9.10"
