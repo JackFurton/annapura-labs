@@ -98,6 +98,25 @@ pub fn add_in_place(x: &mut [f32], y: &[f32]) {
     }
 }
 
+/// Elementwise `x *= y`.
+pub fn mul_in_place(x: &mut [f32], y: &[f32]) {
+    assert_eq!(x.len(), y.len());
+    for i in 0..x.len() {
+        x[i] *= y[i];
+    }
+}
+
+/// SiLU activation (a.k.a. Swish): `silu(z) = z · σ(z) = z / (1 + e^-z)`.
+///
+/// Smooth, non-monotonic (small dip around z = -1.28), approaches `z` as
+/// `z → +∞` and `0` as `z → -∞`. Llama's FFN uses it as the gate
+/// non-linearity in SwiGLU: `out = down(silu(gate(x)) ⊙ up(x))`.
+pub fn silu_in_place(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +281,28 @@ mod tests {
         let mut x = vec![1.0, 2.0, 3.0];
         add_in_place(&mut x, &[10.0, 20.0, 30.0]);
         assert_eq!(x, vec![11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn mul_in_place_multiplies_elementwise() {
+        let mut x = vec![1.0, 2.0, 3.0];
+        mul_in_place(&mut x, &[10.0, 20.0, 30.0]);
+        assert_eq!(x, vec![10.0, 40.0, 90.0]);
+    }
+
+    #[test]
+    fn silu_known_values() {
+        let mut x = vec![0.0, 1.0, -1.0, 10.0, -10.0];
+        silu_in_place(&mut x);
+        // silu(0) = 0
+        assert!(x[0].abs() < 1e-7);
+        // silu(1) = 1 / (1 + e^-1) ≈ 0.7310585786
+        assert!((x[1] - 0.7310586).abs() < 1e-5);
+        // silu(-1) = -1 / (1 + e) ≈ -0.2689414213
+        assert!((x[2] - -0.2689414).abs() < 1e-5);
+        // silu(10) ≈ 10 (saturates linearly for large positive)
+        assert!((x[3] - 10.0).abs() < 1e-3);
+        // silu(-10) ≈ 0 (saturates near zero for large negative)
+        assert!(x[4].abs() < 1e-3);
     }
 }

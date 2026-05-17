@@ -14,7 +14,7 @@ in later chapters.
 
 ```
 Chapter 0  Foundations                 ████████████████████ done
-Chapter 1  Correct slow forward pass   ██████████████████░░ 5/6 + 6a
+Chapter 1  Correct slow forward pass   ███████████████████░ 5/6 + 6a+6b
 Chapter 2  Fast CPU kernels            ░░░░░░░░░░░░░░░░░░░░
 Chapter 3  Real attention (Flash, KV)  ░░░░░░░░░░░░░░░░░░░░
 Chapter 4  Serving infra               ░░░░░░░░░░░░░░░░░░░░
@@ -34,7 +34,7 @@ showing what speedup it would buy us over the CPU baseline from chapters
 |---|---|
 | `src/gguf.rs` | GGUF v3 binary format reader (mmap'd, no copy) |
 | `src/quant.rs` | Dequantization to f32 — F32 / F16 / Q8_0 |
-| `src/nn.rs` | Neural net primitives — RMSNorm, Linear, RoPE, softmax, add |
+| `src/nn.rs` | Neural net primitives — RMSNorm, Linear, RoPE, softmax, add, mul, SiLU |
 | `src/attention.rs` | Scaled dot-product attention + KV cache (GQA-aware) |
 | `src/matmul.rs` | Matrix multiplication kernels — naive scalar baseline |
 | `src/bin/inspect.rs` | Model inspection CLI — metadata + tensor dump |
@@ -130,6 +130,11 @@ parser was working:
   is a *deeper-layer* phenomenon. Layer 0 mostly does shallow positional
   / lexical mixing. The "BOS as attention sink" pattern famously seen at
   layers 12+ is also absent at layer 0.
+- **The block self-normalizes magnitudes.** Input embedding norms spanned
+  ~6× (BOS at 0.10 vs normal tokens at 0.65). After one full transformer
+  block they span ~1.4× (0.80 to 1.11) — without any explicit output
+  norm. The FFN rescues BOS by amplifying it 10×; other tokens get ~2×.
+  Architectural homeostasis is real and visible at layer 0 already.
 
 ## Non-goals (for honest self-discipline)
 

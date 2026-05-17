@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 
 use annapura::attention::{attention, attention_pattern, KvCache};
 use annapura::gguf::{Model, Value};
-use annapura::nn::{add_in_place, linear, rmsnorm, rope_heads};
+use annapura::nn::{add_in_place, linear, mul_in_place, rmsnorm, rope_heads, silu_in_place};
 
 const DEFAULT_PATH: &str = "models/tinyllama-1.1b-chat-q8_0.gguf";
 
@@ -31,6 +31,7 @@ fn main() -> Result<()> {
     let n_heads = meta_u32(&model, "llama.attention.head_count")? as usize;
     let n_kv_heads = meta_u32(&model, "llama.attention.head_count_kv")? as usize;
     let max_seq_len = meta_u32(&model, "llama.context_length")? as usize;
+    let intermediate = meta_u32(&model, "llama.feed_forward_length")? as usize;
     let hidden = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
@@ -41,66 +42,82 @@ fn main() -> Result<()> {
     let wk = model.dequantize(model.tensor("blk.0.attn_k.weight").unwrap())?;
     let wv = model.dequantize(model.tensor("blk.0.attn_v.weight").unwrap())?;
     let wo = model.dequantize(model.tensor("blk.0.attn_output.weight").unwrap())?;
-    let total_mb = (attn_norm_w.len() + wq.len() + wk.len() + wv.len() + wo.len()) as f64 * 4.0 / 1e6;
+    let ffn_norm_w = model.dequantize(model.tensor("blk.0.ffn_norm.weight").unwrap())?;
+    let w_gate = model.dequantize(model.tensor("blk.0.ffn_gate.weight").unwrap())?;
+    let w_up = model.dequantize(model.tensor("blk.0.ffn_up.weight").unwrap())?;
+    let w_down = model.dequantize(model.tensor("blk.0.ffn_down.weight").unwrap())?;
+    let total_mb = (attn_norm_w.len()
+        + wq.len() + wk.len() + wv.len() + wo.len()
+        + ffn_norm_w.len() + w_gate.len() + w_up.len() + w_down.len()) as f64 * 4.0 / 1e6;
     eprintln!("{:?} ({:.1} MB of f32)", t0.elapsed(), total_mb);
 
     let embed_table = model.tensor("token_embd.weight").unwrap();
 
     println!();
-    println!("config: hidden={}, kv_dim={}, head_dim={}, n_heads={}, n_kv_heads={} ({} Q heads per KV)",
-             hidden, kv_dim, head_dim, n_heads, n_kv_heads, n_heads / n_kv_heads);
+    println!("config: hidden={}, intermediate={}, kv_dim={}, head_dim={}, n_heads={}, n_kv_heads={} ({} Q heads per KV)",
+             hidden, intermediate, kv_dim, head_dim, n_heads, n_kv_heads, n_heads / n_kv_heads);
     println!("        eps={}, rope_freq_base={}, max_seq_len={}", eps, freq_base, max_seq_len);
     println!();
 
     let mut cache = KvCache::new(max_seq_len, kv_dim);
 
-    // Per-token scratch buffers (reused across the loop, allocated once).
+    // Persistent scratch buffers, allocated once outside the per-token loop.
     let mut normed = vec![0.0_f32; hidden];
     let mut q = vec![0.0_f32; hidden];
     let mut k = vec![0.0_f32; kv_dim];
     let mut v = vec![0.0_f32; kv_dim];
     let mut attn = vec![0.0_f32; hidden];
     let mut attn_proj = vec![0.0_f32; hidden];
+    let mut ffn_normed = vec![0.0_f32; hidden];
+    let mut gate = vec![0.0_f32; intermediate];
+    let mut up = vec![0.0_f32; intermediate];
+    let mut ffn_out = vec![0.0_f32; hidden];
 
     let mut patterns: Vec<Vec<f32>> = Vec::with_capacity(token_ids.len());
 
     println!(
         "  {:>5}  {:>3}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
-        "tok", "pos", "‖x‖", "‖q‖", "‖k‖", "‖attn‖", "‖resid‖"
+        "tok", "pos", "‖x‖", "‖attn_o‖", "‖resid1‖", "‖ffn_o‖", "‖resid2‖"
     );
 
     for (pos, &id) in token_ids.iter().enumerate() {
         let t_token = Instant::now();
         let mut x = model.dequantize_row(embed_table, id)?;
+        let x_norm_in = l2(&x);
 
+        // === Attention sublayer ===
         rmsnorm(&x, &attn_norm_w, eps, &mut normed);
         linear(&normed, &wq, &mut q);
         linear(&normed, &wk, &mut k);
         linear(&normed, &wv, &mut v);
         rope_heads(&mut q, head_dim, pos, freq_base);
         rope_heads(&mut k, head_dim, pos, freq_base);
-
         cache.store(pos, &k, &v);
-
         attention(&q, &cache, pos, n_heads, n_kv_heads, head_dim, &mut attn);
         linear(&attn, &wo, &mut attn_proj);
-
-        // Residual: x ← x + attn_proj (this is the input to the FFN sublayer in a full block).
         add_in_place(&mut x, &attn_proj);
+        let resid1 = l2(&x);
+
+        // === FFN sublayer ===
+        rmsnorm(&x, &ffn_norm_w, eps, &mut ffn_normed);
+        linear(&ffn_normed, &w_gate, &mut gate);
+        linear(&ffn_normed, &w_up, &mut up);
+        silu_in_place(&mut gate);
+        mul_in_place(&mut gate, &up);
+        linear(&gate, &w_down, &mut ffn_out);
+        add_in_place(&mut x, &ffn_out);
+        let resid2 = l2(&x);
 
         let pattern = attention_pattern(&q, &cache, pos, n_heads, n_kv_heads, head_dim);
         patterns.push(pattern);
 
         println!(
             "  {:>5}  {:>3}  {:>8.4}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}  [{:.2?}]",
-            id, pos,
-            l2_of_dequantized(&model, embed_table, id)?,
-            l2(&q), l2(&k), l2(&attn_proj), l2(&x),
+            id, pos, x_norm_in, l2(&attn_proj), resid1, l2(&ffn_out), resid2,
             t_token.elapsed()
         );
     }
 
-    // Pretty-print the attention pattern: rows = queries, cols = key positions.
     println!();
     println!("attention pattern (avg over {} heads, row = querying token, col = past pos):", n_heads);
     print!("  {:>10}", "");
@@ -141,8 +158,4 @@ fn meta_u32(model: &Model, key: &str) -> Result<u32> {
 
 fn l2(x: &[f32]) -> f32 {
     x.iter().map(|v| v * v).sum::<f32>().sqrt()
-}
-
-fn l2_of_dequantized(model: &Model, t: &annapura::gguf::TensorInfo, row: usize) -> Result<f32> {
-    Ok(l2(&model.dequantize_row(t, row)?))
 }
