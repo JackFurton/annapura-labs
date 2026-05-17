@@ -5,5 +5,6 @@ pub mod gguf;
 pub mod matmul;
 pub mod nn;
 pub mod quant;
+pub mod transformer;
 
 pub use matmul::matmul_naive;

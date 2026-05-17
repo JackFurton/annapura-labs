@@ -14,7 +14,7 @@ in later chapters.
 
 ```
 Chapter 0  Foundations                 ████████████████████ done
-Chapter 1  Correct slow forward pass   ███████████████████░ 5/6 + 6a+6b
+Chapter 1  Correct slow forward pass   ████████████████████ done
 Chapter 2  Fast CPU kernels            ░░░░░░░░░░░░░░░░░░░░
 Chapter 3  Real attention (Flash, KV)  ░░░░░░░░░░░░░░░░░░░░
 Chapter 4  Serving infra               ░░░░░░░░░░░░░░░░░░░░
@@ -36,10 +36,12 @@ showing what speedup it would buy us over the CPU baseline from chapters
 | `src/quant.rs` | Dequantization to f32 — F32 / F16 / Q8_0 |
 | `src/nn.rs` | Neural net primitives — RMSNorm, Linear, RoPE, softmax, add, mul, SiLU |
 | `src/attention.rs` | Scaled dot-product attention + KV cache (GQA-aware) |
+| `src/transformer.rs` | Config + LayerWeights + Scratch + one-layer forward |
 | `src/matmul.rs` | Matrix multiplication kernels — naive scalar baseline |
 | `src/bin/inspect.rs` | Model inspection CLI — metadata + tensor dump |
 | `src/bin/embed.rs` | Token embedding lookup demo |
-| `src/bin/forward.rs` | Partial forward pass: embedding → RMSNorm |
+| `src/bin/forward.rs` | Single-layer diagnostic — attention patterns |
+| `src/bin/generate.rs` | Full inference: 22 layers + output head → next token |
 | `benches/matmul.rs` | criterion perf bench |
 
 About 800 lines of Rust, 3 runtime deps (`memmap2`, `anyhow`, `half`),
@@ -86,8 +88,11 @@ cargo run --release --bin inspect -- --values blk.0.attn_q.weight 8
 # Look up token embeddings
 cargo run --release --bin embed -- 0 1 2 100 1000
 
-# Apply embedding + RMSNorm to a few tokens
-cargo run --release --bin forward -- 0 1 2 100 1000
+# Diagnostic: single-layer forward pass with attention patterns
+cargo run --release --bin forward -- 1 15043 1925 338 263 8225
+
+# Full inference: 22 layers + output head → next-token prediction
+cargo run --release --bin generate -- 1 15043 1925 338 263 8225
 ```
 
 ## Getting the model
