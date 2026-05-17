@@ -37,6 +37,49 @@ pub fn linear(x: &[f32], w: &[f32], y: &mut [f32]) {
     }
 }
 
+/// SIMD-accelerated `y = W·x`. Same contract as `linear`, but uses 8-wide f32
+/// vector accumulators so the inner reduction doesn't bottleneck the way it
+/// does for the scalar version.
+///
+/// Why this is faster: the scalar loop's `acc += x[i] * row[i]` is a reduction
+/// — LLVM's auto-vectorizer struggles with it because the horizontal sum at
+/// the end is expensive relative to the FMAs. With explicit SIMD we
+/// accumulate into 8 independent lanes (no reduction in the hot loop) and
+/// only reduce once at the very end. The compiler emits one NEON FMA pair
+/// per chunk (on Apple Silicon) or one AVX2 FMA (on x86 with AVX2).
+pub fn linear_simd(x: &[f32], w: &[f32], y: &mut [f32]) {
+    use wide::f32x8;
+
+    let in_dim = x.len();
+    let out_dim = y.len();
+    assert_eq!(w.len(), in_dim * out_dim);
+
+    let chunks = in_dim / 8;
+    let tail_start = chunks * 8;
+
+    for j in 0..out_dim {
+        let row = &w[j * in_dim..(j + 1) * in_dim];
+        let mut acc = f32x8::ZERO;
+        for ci in 0..chunks {
+            let off = ci * 8;
+            let xv = load_f32x8(x, off);
+            let wv = load_f32x8(row, off);
+            acc = wv.mul_add(xv, acc);
+        }
+        let mut sum = acc.reduce_add();
+        for i in tail_start..in_dim {
+            sum += x[i] * row[i];
+        }
+        y[j] = sum;
+    }
+}
+
+#[inline(always)]
+fn load_f32x8(s: &[f32], off: usize) -> wide::f32x8 {
+    let arr: [f32; 8] = s[off..off + 8].try_into().expect("slice of length 8");
+    wide::f32x8::from(arr)
+}
+
 /// RoPE (Rotary Positional Embedding), Llama-style (interleaved pairs).
 ///
 /// For each pair `(x[2i], x[2i+1])` of a `head_dim`-long vector, rotate by
@@ -193,6 +236,42 @@ mod tests {
         let mut y = vec![0.0; 3];
         linear(&x, &w, &mut y);
         assert_eq!(y, vec![50.0, 110.0, 170.0]);
+    }
+
+    #[test]
+    fn linear_simd_matches_linear_clean_dims() {
+        // in_dim = 64 (clean multiple of 8), out_dim = 32.
+        let in_dim = 64;
+        let out_dim = 32;
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.073).sin()).collect();
+        let w: Vec<f32> = (0..in_dim * out_dim).map(|i| ((i as f32) * 0.019).cos()).collect();
+        let mut y_scalar = vec![0.0_f32; out_dim];
+        let mut y_simd = vec![0.0_f32; out_dim];
+        linear(&x, &w, &mut y_scalar);
+        linear_simd(&x, &w, &mut y_simd);
+        for j in 0..out_dim {
+            assert!(
+                (y_scalar[j] - y_simd[j]).abs() < 1e-4,
+                "mismatch at {}: scalar {} vs simd {}",
+                j, y_scalar[j], y_simd[j]
+            );
+        }
+    }
+
+    #[test]
+    fn linear_simd_matches_linear_with_tail() {
+        // in_dim = 100 (12 full chunks of 8 plus a 4-element tail)
+        let in_dim = 100;
+        let out_dim = 17;
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let w: Vec<f32> = (0..in_dim * out_dim).map(|i| ((i as f32) * 0.029).cos()).collect();
+        let mut y_scalar = vec![0.0_f32; out_dim];
+        let mut y_simd = vec![0.0_f32; out_dim];
+        linear(&x, &w, &mut y_scalar);
+        linear_simd(&x, &w, &mut y_simd);
+        for j in 0..out_dim {
+            assert!((y_scalar[j] - y_simd[j]).abs() < 1e-4);
+        }
     }
 
     #[test]

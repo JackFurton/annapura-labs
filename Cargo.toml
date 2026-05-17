@@ -24,3 +24,4 @@ codegen-units = 1
 anyhow = "1.0.102"
 half = "2.7.1"
 memmap2 = "0.9.10"
+wide = "1.4.0"
