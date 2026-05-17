@@ -48,30 +48,65 @@ pub fn linear(x: &[f32], w: &[f32], y: &mut [f32]) {
 /// only reduce once at the very end. The compiler emits one NEON FMA pair
 /// per chunk (on Apple Silicon) or one AVX2 FMA (on x86 with AVX2).
 pub fn linear_simd(x: &[f32], w: &[f32], y: &mut [f32]) {
-    use wide::f32x8;
+    let in_dim = x.len();
+    let out_dim = y.len();
+    assert_eq!(w.len(), in_dim * out_dim);
+    for j in 0..out_dim {
+        let row = &w[j * in_dim..(j + 1) * in_dim];
+        y[j] = dot_f32_simd(x, row);
+    }
+}
+
+/// Multi-threaded version of `linear_simd`. Each output `y[j]` is an
+/// independent dot product, so we slice the output across threads via rayon
+/// and let each thread run the same per-row SIMD kernel.
+///
+/// Chunk size is a tuning knob: too small → thread overhead dominates,
+/// too large → uneven work distribution at the tail. 64 outputs per chunk
+/// works well at the dimensions we care about (256 → 4 chunks, 2048 → 32
+/// chunks, 5632 → 88 chunks, 32000 → 500 chunks).
+pub fn linear_simd_par(x: &[f32], w: &[f32], y: &mut [f32]) {
+    use rayon::prelude::*;
 
     let in_dim = x.len();
     let out_dim = y.len();
     assert_eq!(w.len(), in_dim * out_dim);
 
-    let chunks = in_dim / 8;
+    const CHUNK: usize = 64;
+
+    y.par_chunks_mut(CHUNK).enumerate().for_each(|(chunk_idx, y_chunk)| {
+        let base_j = chunk_idx * CHUNK;
+        for (offset, y_val) in y_chunk.iter_mut().enumerate() {
+            let j = base_j + offset;
+            let row = &w[j * in_dim..(j + 1) * in_dim];
+            *y_val = dot_f32_simd(x, row);
+        }
+    });
+}
+
+/// Single-row dot product `Σ x[i] * row[i]` with f32x8 vector accumulation
+/// and tail handling. Shared between linear_simd and linear_simd_par.
+#[inline]
+fn dot_f32_simd(x: &[f32], row: &[f32]) -> f32 {
+    use wide::f32x8;
+    debug_assert_eq!(x.len(), row.len());
+
+    let n = x.len();
+    let chunks = n / 8;
     let tail_start = chunks * 8;
 
-    for j in 0..out_dim {
-        let row = &w[j * in_dim..(j + 1) * in_dim];
-        let mut acc = f32x8::ZERO;
-        for ci in 0..chunks {
-            let off = ci * 8;
-            let xv = load_f32x8(x, off);
-            let wv = load_f32x8(row, off);
-            acc = wv.mul_add(xv, acc);
-        }
-        let mut sum = acc.reduce_add();
-        for i in tail_start..in_dim {
-            sum += x[i] * row[i];
-        }
-        y[j] = sum;
+    let mut acc = f32x8::ZERO;
+    for ci in 0..chunks {
+        let off = ci * 8;
+        let xv = load_f32x8(x, off);
+        let wv = load_f32x8(row, off);
+        acc = wv.mul_add(xv, acc);
     }
+    let mut sum = acc.reduce_add();
+    for i in tail_start..n {
+        sum += x[i] * row[i];
+    }
+    sum
 }
 
 #[inline(always)]
@@ -271,6 +306,43 @@ mod tests {
         linear_simd(&x, &w, &mut y_simd);
         for j in 0..out_dim {
             assert!((y_scalar[j] - y_simd[j]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn linear_simd_par_matches_serial() {
+        // Use out_dim large enough to actually exercise multiple chunks
+        // (CHUNK=64, so >64 outputs trigger real parallel work).
+        let in_dim = 2048;
+        let out_dim = 200;
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.001).sin()).collect();
+        let w: Vec<f32> = (0..in_dim * out_dim).map(|i| ((i as f32) * 0.0001).cos()).collect();
+        let mut y_serial = vec![0.0_f32; out_dim];
+        let mut y_par = vec![0.0_f32; out_dim];
+        linear_simd(&x, &w, &mut y_serial);
+        linear_simd_par(&x, &w, &mut y_par);
+        for j in 0..out_dim {
+            assert!(
+                (y_serial[j] - y_par[j]).abs() < 1e-4,
+                "mismatch at {}: serial {} vs par {}",
+                j, y_serial[j], y_par[j]
+            );
+        }
+    }
+
+    #[test]
+    fn linear_simd_par_handles_small_output() {
+        // out_dim < CHUNK means just one chunk on one thread — still correct.
+        let in_dim = 64;
+        let out_dim = 5;
+        let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.1).collect();
+        let w: Vec<f32> = (0..in_dim * out_dim).map(|i| (i as f32) * 0.01).collect();
+        let mut y_serial = vec![0.0_f32; out_dim];
+        let mut y_par = vec![0.0_f32; out_dim];
+        linear_simd(&x, &w, &mut y_serial);
+        linear_simd_par(&x, &w, &mut y_par);
+        for j in 0..out_dim {
+            assert!((y_serial[j] - y_par[j]).abs() < 1e-4);
         }
     }
 

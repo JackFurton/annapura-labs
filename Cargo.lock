@@ -25,6 +25,7 @@ dependencies = [
  "criterion",
  "half",
  "memmap2",
+ "rayon",
  "wide",
 ]
 

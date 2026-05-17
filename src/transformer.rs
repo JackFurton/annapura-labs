@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 
 use crate::attention::{attention, KvCache};
 use crate::gguf::{Model, Value};
-use crate::nn::{add_in_place, linear_simd as linear, mul_in_place, rmsnorm, rope_heads, silu_in_place};
+use crate::nn::{add_in_place, linear_simd_par as linear, mul_in_place, rmsnorm, rope_heads, silu_in_place};
 
 pub struct Config {
     pub eps: f32,
