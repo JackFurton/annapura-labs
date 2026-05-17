@@ -14,7 +14,7 @@ in later chapters.
 
 ```
 Chapter 0  Foundations                 ████████████████████ done
-Chapter 1  Correct slow forward pass   ████████████░░░░░░░░ 4/6
+Chapter 1  Correct slow forward pass   ████████████████░░░░ 5/6
 Chapter 2  Fast CPU kernels            ░░░░░░░░░░░░░░░░░░░░
 Chapter 3  Real attention (Flash, KV)  ░░░░░░░░░░░░░░░░░░░░
 Chapter 4  Serving infra               ░░░░░░░░░░░░░░░░░░░░
@@ -34,7 +34,7 @@ showing what speedup it would buy us over the CPU baseline from chapters
 |---|---|
 | `src/gguf.rs` | GGUF v3 binary format reader (mmap'd, no copy) |
 | `src/quant.rs` | Dequantization to f32 — F32 / F16 / Q8_0 |
-| `src/nn.rs` | Neural net primitives — RMSNorm |
+| `src/nn.rs` | Neural net primitives — RMSNorm, Linear, RoPE |
 | `src/matmul.rs` | Matrix multiplication kernels — naive scalar baseline |
 | `src/bin/inspect.rs` | Model inspection CLI — metadata + tensor dump |
 | `src/bin/embed.rs` | Token embedding lookup demo |
@@ -119,6 +119,11 @@ parser was working:
 - **GGUF reverses PyTorch shapes.** `token_embd.weight` is `[32000, 2048]`
   in PyTorch but `[2048, 32000]` in GGUF — fastest-changing axis first.
   Same bytes, different label order.
+- **V is ~100× smaller than Q/K** in trained weights. Q and K only matter
+  via their dot product (the attention score) so they're scale-coupled.
+  V is *content* that gets weighted-summed into the residual stream — it
+  has to stay small to keep the residual stable. We see this directly in
+  TinyLlama: ‖q‖ ≈ ‖k‖ ≈ 20 but ‖v‖ ≈ 0.2 on real tokens at layer 0.
 
 ## Non-goals (for honest self-discipline)
 
