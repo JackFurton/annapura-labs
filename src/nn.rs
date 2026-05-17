@@ -72,6 +72,32 @@ pub fn rope_heads(x: &mut [f32], head_dim: usize, pos: usize, freq_base: f32) {
     }
 }
 
+/// Softmax in place, with the standard max-subtraction trick for numerical
+/// stability. After the call, `x` sums to 1 and every entry is in `[0, 1]`.
+pub fn softmax_in_place(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let max_val = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f32;
+    for v in x.iter_mut() {
+        *v = (*v - max_val).exp();
+        sum += *v;
+    }
+    let inv = 1.0 / sum;
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// Elementwise `x += y`. Used for residual connections.
+pub fn add_in_place(x: &mut [f32], y: &[f32]) {
+    assert_eq!(x.len(), y.len());
+    for i in 0..x.len() {
+        x[i] += y[i];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +225,42 @@ mod tests {
         assert!((multi[1] - single[1]).abs() < 1e-6);
         assert!((multi[2] - single[0]).abs() < 1e-6);
         assert!((multi[3] - single[1]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn softmax_uniform_input_gives_uniform_output() {
+        let mut x = vec![1.0, 1.0, 1.0, 1.0];
+        softmax_in_place(&mut x);
+        for v in &x {
+            assert!((v - 0.25).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn softmax_one_hot_input_concentrates_mass() {
+        // x = [0, 100, 0]: after softmax the middle dominates.
+        let mut x = vec![0.0, 100.0, 0.0];
+        softmax_in_place(&mut x);
+        assert!(x[1] > 0.999);
+        assert!(x[0] < 0.001 && x[2] < 0.001);
+    }
+
+    #[test]
+    fn softmax_survives_huge_inputs_without_overflow() {
+        // Without max-subtraction, exp(1000) is +inf. Verify we handle it.
+        let mut x = vec![1000.0, 1000.001, 999.999];
+        softmax_in_place(&mut x);
+        let sum: f32 = x.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "sum = {}", sum);
+        // The largest input should still get the largest probability.
+        assert!(x[1] > x[0]);
+        assert!(x[1] > x[2]);
+    }
+
+    #[test]
+    fn add_in_place_sums_elementwise() {
+        let mut x = vec![1.0, 2.0, 3.0];
+        add_in_place(&mut x, &[10.0, 20.0, 30.0]);
+        assert_eq!(x, vec![11.0, 22.0, 33.0]);
     }
 }
