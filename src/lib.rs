@@ -7,4 +7,4 @@ pub mod nn;
 pub mod quant;
 pub mod transformer;
 
-pub use matmul::{matmul_ikj, matmul_naive};
+pub use matmul::{matmul_blocked, matmul_ikj, matmul_naive};

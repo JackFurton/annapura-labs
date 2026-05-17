@@ -24,7 +24,58 @@ pub fn matmul_naive(
     }
 }
 
-/// Same C = A·B, but with loops reordered i,k,j instead of i,j,k.
+/// Cache-blocked C = A·B. Identical inner kernel to `matmul_ikj` (so the
+/// auto-vectorizer keeps doing its thing), but constrained to operate on a
+/// tile small enough that the working set fits in L1.
+///
+/// Block sizes are 64×64×64 — three 64×64 tiles (A, B, C) is 48 KB of f32,
+/// well under the 128 KB L1d on an M3 P-core. Outer loop order is (i, j, k)
+/// so that the C tile stays "hot" while we sweep across K and accumulate
+/// into it; A and B tiles are touched once per outer K step.
+///
+/// Edge handling: dimensions that aren't multiples of 64 produce smaller
+/// blocks at the boundary, via `MC.min(m - ic)` etc. Block sizes are
+/// constants for now; chapter-2 tuning could choose them per matrix size.
+pub fn matmul_blocked(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), k * n);
+    assert_eq!(c.len(), m * n);
+    c.fill(0.0);
+
+    const MC: usize = 64;
+    const NC: usize = 64;
+    const KC: usize = 64;
+
+    for ic in (0..m).step_by(MC) {
+        let mc = MC.min(m - ic);
+        for jc in (0..n).step_by(NC) {
+            let nc = NC.min(n - jc);
+            for kc in (0..k).step_by(KC) {
+                let kc_len = KC.min(k - kc);
+                for i in 0..mc {
+                    let a_row_off = (ic + i) * k + kc;
+                    let c_row_off = (ic + i) * n + jc;
+                    let c_row = &mut c[c_row_off..c_row_off + nc];
+                    for kk in 0..kc_len {
+                        let a_ik = a[a_row_off + kk];
+                        let b_off = (kc + kk) * n + jc;
+                        let b_row = &b[b_off..b_off + nc];
+                        for j in 0..nc {
+                            c_row[j] += a_ik * b_row[j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 ///
 /// The win: the innermost loop now strides sequentially through *both* B and C
 /// along their last (fastest-changing) dimension, instead of striding down a
@@ -141,5 +192,46 @@ mod tests {
         let mut c = vec![999.0_f32; 4];
         matmul_ikj(&a, &b, &mut c, 2, 2, 2);
         assert_eq!(c, vec![1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn blocked_matches_naive_block_aligned() {
+        // 128 = 2 × 64, exercises clean block boundaries on all three dims.
+        let a = pseudo_fill(128, 128, 7);
+        let b = pseudo_fill(128, 128, 11);
+        let mut c_naive = vec![0.0_f32; 128 * 128];
+        let mut c_blocked = vec![0.0_f32; 128 * 128];
+        matmul_naive(&a, &b, &mut c_naive, 128, 128, 128);
+        matmul_blocked(&a, &b, &mut c_blocked, 128, 128, 128);
+        for i in 0..c_naive.len() {
+            assert!((c_naive[i] - c_blocked[i]).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn blocked_matches_naive_misaligned() {
+        // 75×85×60 — none divisible by 64. Tests edge-block handling.
+        let a = pseudo_fill(75, 60, 13);
+        let b = pseudo_fill(60, 85, 17);
+        let mut c_naive = vec![0.0_f32; 75 * 85];
+        let mut c_blocked = vec![0.0_f32; 75 * 85];
+        matmul_naive(&a, &b, &mut c_naive, 75, 85, 60);
+        matmul_blocked(&a, &b, &mut c_blocked, 75, 85, 60);
+        for i in 0..c_naive.len() {
+            assert!(
+                (c_naive[i] - c_blocked[i]).abs() < 1e-3,
+                "mismatch at {}: {} vs {}",
+                i, c_naive[i], c_blocked[i]
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_known_answer() {
+        let a = vec![1., 2., 3., 4.];
+        let b = vec![5., 6., 7., 8.];
+        let mut c = vec![0.0_f32; 4];
+        matmul_blocked(&a, &b, &mut c, 2, 2, 2);
+        assert_eq!(c, vec![19., 22., 43., 50.]);
     }
 }
