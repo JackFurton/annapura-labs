@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 
 use annapura::attention::KvCache;
 use annapura::gguf::Model;
-use annapura::nn::{linear, rmsnorm};
+use annapura::nn::{linear_q8_par, rmsnorm};
 use annapura::transformer::{forward_layer, Config, LayerWeights, Scratch};
 
 const DEFAULT_PATH: &str = "models/tinyllama-1.1b-chat-q8_0.gguf";
@@ -28,22 +28,23 @@ fn main() -> Result<()> {
         cfg.n_layers, cfg.hidden, cfg.intermediate, cfg.vocab, cfg.max_seq_len
     );
 
-    eprint!("loading all {} layers... ", cfg.n_layers);
+    eprint!("borrowing all {} layers' weights... ", cfg.n_layers);
     let t_load = Instant::now();
-    let layers: Vec<LayerWeights> = (0..cfg.n_layers)
+    let layers: Vec<LayerWeights<'_>> = (0..cfg.n_layers)
         .map(|l| LayerWeights::load(&model, l))
         .collect::<Result<_>>()?;
-    let layer_mb = layers.iter().map(layer_size_mb).sum::<f64>();
-    eprintln!("{:?} ({:.1} MB f32)", t_load.elapsed(), layer_mb);
+    let layer_mb: f64 = layers.iter().map(layer_size_mb).sum();
+    eprintln!("{:?} (~{:.1} MB total, mostly mmap'd packed bytes)", t_load.elapsed(), layer_mb);
 
-    eprint!("loading output head... ");
+    eprint!("preparing output head... ");
     let t_head = Instant::now();
     let output_norm_w = model.dequantize(model.tensor("output_norm.weight").unwrap())?;
-    let output_w = model.dequantize(model.tensor("output.weight").unwrap())?;
+    let output_w_bytes = model.tensor_bytes(model.tensor("output.weight").unwrap());
     eprintln!(
-        "{:?} ({:.1} MB f32)",
+        "{:?} (output_norm {:.1} MB f32, output.weight {:.1} MB packed Q8_0)",
         t_head.elapsed(),
-        (output_norm_w.len() + output_w.len()) as f64 * 4.0 / 1e6
+        output_norm_w.len() as f64 * 4.0 / 1e6,
+        output_w_bytes.len() as f64 / 1e6,
     );
 
     let embed_table = model.tensor("token_embd.weight").unwrap();
@@ -69,7 +70,7 @@ fn main() -> Result<()> {
 
     let t_head_eval = Instant::now();
     rmsnorm(&x, &output_norm_w, cfg.eps, &mut final_normed);
-    linear(&final_normed, &output_w, &mut logits);
+    linear_q8_par(&final_normed, output_w_bytes, &mut logits);
     eprintln!("output head: {:?}\n", t_head_eval.elapsed());
 
     let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
@@ -95,10 +96,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Approximate resident size of a layer's weights: norms in f32, linears as
+/// the packed-byte view length (not f32-expanded).
 fn layer_size_mb(layer: &LayerWeights) -> f64 {
-    let n = layer.attn_norm.len()
-        + layer.wq.len() + layer.wk.len() + layer.wv.len() + layer.wo.len()
-        + layer.ffn_norm.len()
-        + layer.w_gate.len() + layer.w_up.len() + layer.w_down.len();
-    n as f64 * 4.0 / 1e6
+    let norm_bytes = (layer.attn_norm.len() + layer.ffn_norm.len()) * 4;
+    let packed_bytes = layer.wq.len()
+        + layer.wk.len()
+        + layer.wv.len()
+        + layer.wo.len()
+        + layer.w_gate.len()
+        + layer.w_up.len()
+        + layer.w_down.len();
+    (norm_bytes + packed_bytes) as f64 / 1e6
 }

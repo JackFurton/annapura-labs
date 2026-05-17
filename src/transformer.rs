@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 
 use crate::attention::{attention, KvCache};
 use crate::gguf::{Model, Value};
-use crate::nn::{add_in_place, linear_simd_par as linear, mul_in_place, rmsnorm, rope_heads, silu_in_place};
+use crate::nn::{add_in_place, linear_q8_par, mul_in_place, rmsnorm, rope_heads, silu_in_place};
 
 pub struct Config {
     pub eps: f32,
@@ -52,21 +52,32 @@ impl Config {
     }
 }
 
-pub struct LayerWeights {
+/// Per-layer weights. Norms are F32 in GGUF and small (2048 floats each) so
+/// we just dequantize them once. The 7 Q8_0 linear weights are kept as raw
+/// packed-byte views into the model's mmap — they're consumed directly by
+/// `linear_q8_par`, with no f32 materialization step.
+pub struct LayerWeights<'a> {
     pub attn_norm: Vec<f32>,
-    pub wq: Vec<f32>,
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
     pub ffn_norm: Vec<f32>,
-    pub w_gate: Vec<f32>,
-    pub w_up: Vec<f32>,
-    pub w_down: Vec<f32>,
+    pub wq: &'a [u8],
+    pub wk: &'a [u8],
+    pub wv: &'a [u8],
+    pub wo: &'a [u8],
+    pub w_gate: &'a [u8],
+    pub w_up: &'a [u8],
+    pub w_down: &'a [u8],
 }
 
-impl LayerWeights {
-    pub fn load(model: &Model, layer_idx: usize) -> Result<Self> {
-        let t = |name: &str| -> Result<Vec<f32>> {
+impl<'a> LayerWeights<'a> {
+    pub fn load(model: &'a Model, layer_idx: usize) -> Result<Self> {
+        let bytes = |name: &str| -> Result<&'a [u8]> {
+            let full = format!("blk.{}.{}", layer_idx, name);
+            let tensor = model
+                .tensor(&full)
+                .ok_or_else(|| anyhow!("missing tensor {:?}", full))?;
+            Ok(model.tensor_bytes(tensor))
+        };
+        let dequant_f32 = |name: &str| -> Result<Vec<f32>> {
             let full = format!("blk.{}.{}", layer_idx, name);
             let tensor = model
                 .tensor(&full)
@@ -74,15 +85,15 @@ impl LayerWeights {
             model.dequantize(tensor)
         };
         Ok(Self {
-            attn_norm: t("attn_norm.weight")?,
-            wq: t("attn_q.weight")?,
-            wk: t("attn_k.weight")?,
-            wv: t("attn_v.weight")?,
-            wo: t("attn_output.weight")?,
-            ffn_norm: t("ffn_norm.weight")?,
-            w_gate: t("ffn_gate.weight")?,
-            w_up: t("ffn_up.weight")?,
-            w_down: t("ffn_down.weight")?,
+            attn_norm: dequant_f32("attn_norm.weight")?,
+            ffn_norm: dequant_f32("ffn_norm.weight")?,
+            wq: bytes("attn_q.weight")?,
+            wk: bytes("attn_k.weight")?,
+            wv: bytes("attn_v.weight")?,
+            wo: bytes("attn_output.weight")?,
+            w_gate: bytes("ffn_gate.weight")?,
+            w_up: bytes("ffn_up.weight")?,
+            w_down: bytes("ffn_down.weight")?,
         })
     }
 }
@@ -122,16 +133,16 @@ impl Scratch {
 /// `scratch` to avoid per-call allocations.
 pub fn forward_layer(
     x: &mut [f32],
-    layer: &LayerWeights,
+    layer: &LayerWeights<'_>,
     cache: &mut KvCache,
     cfg: &Config,
     scratch: &mut Scratch,
     pos: usize,
 ) {
     rmsnorm(x, &layer.attn_norm, cfg.eps, &mut scratch.normed);
-    linear(&scratch.normed, &layer.wq, &mut scratch.q);
-    linear(&scratch.normed, &layer.wk, &mut scratch.k);
-    linear(&scratch.normed, &layer.wv, &mut scratch.v);
+    linear_q8_par(&scratch.normed, layer.wq, &mut scratch.q);
+    linear_q8_par(&scratch.normed, layer.wk, &mut scratch.k);
+    linear_q8_par(&scratch.normed, layer.wv, &mut scratch.v);
     rope_heads(&mut scratch.q, cfg.head_dim, pos, cfg.freq_base);
     rope_heads(&mut scratch.k, cfg.head_dim, pos, cfg.freq_base);
     cache.store(pos, &scratch.k, &scratch.v);
@@ -140,15 +151,15 @@ pub fn forward_layer(
         cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
         &mut scratch.attn,
     );
-    linear(&scratch.attn, &layer.wo, &mut scratch.attn_proj);
+    linear_q8_par(&scratch.attn, layer.wo, &mut scratch.attn_proj);
     add_in_place(x, &scratch.attn_proj);
 
     rmsnorm(x, &layer.ffn_norm, cfg.eps, &mut scratch.ffn_normed);
-    linear(&scratch.ffn_normed, &layer.w_gate, &mut scratch.gate);
-    linear(&scratch.ffn_normed, &layer.w_up, &mut scratch.up);
+    linear_q8_par(&scratch.ffn_normed, layer.w_gate, &mut scratch.gate);
+    linear_q8_par(&scratch.ffn_normed, layer.w_up, &mut scratch.up);
     silu_in_place(&mut scratch.gate);
     mul_in_place(&mut scratch.gate, &scratch.up);
-    linear(&scratch.gate, &layer.w_down, &mut scratch.ffn_out);
+    linear_q8_par(&scratch.gate, layer.w_down, &mut scratch.ffn_out);
     add_in_place(x, &scratch.ffn_out);
 }
 

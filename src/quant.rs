@@ -49,6 +49,32 @@ fn dequantize_q8_0(src: &[u8], n: usize, dst: &mut [f32]) {
     }
 }
 
+/// Quantize a slice of f32 values into Q8_0 packed bytes. Inverse of
+/// `dequantize_q8_0`, lossy by design — quantization error per block is
+/// bounded by `absmax(block) / 127`. Per-block scale chosen as `absmax/127`
+/// so the largest-magnitude value maps to i8 ±127 exactly. Mainly used in
+/// tests to verify Q8-aware kernels against a known-good packed input.
+pub fn quantize_q8_0(src: &[f32]) -> Vec<u8> {
+    assert_eq!(src.len() % 32, 0, "Q8_0 needs a multiple of 32 elements");
+    let n_blocks = src.len() / 32;
+    let mut out = Vec::with_capacity(n_blocks * 34);
+
+    for block in src.chunks_exact(32) {
+        let absmax = block.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let scale = absmax / 127.0;
+        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+        let scale_f16 = f16::from_f32(scale);
+        out.extend_from_slice(&scale_f16.to_bits().to_le_bytes());
+
+        for &v in block {
+            let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+            out.push(q as u8);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +134,26 @@ mod tests {
         let mut dst = vec![0.0_f32; 3];
         dequantize_to_f32(TensorType::F32, &src, &mut dst).unwrap();
         assert_eq!(dst, vec![1.5, -2.25, 3.14]);
+    }
+
+    #[test]
+    fn q8_0_roundtrip_preserves_signal() {
+        // Quantize, then dequantize. Error should be small relative to the
+        // block's absmax (bounded by absmax/127 ≈ 0.8% per value).
+        let src: Vec<f32> = (0..64).map(|i| (i as f32) * 0.5 - 16.0).collect();
+        let packed = quantize_q8_0(&src);
+        assert_eq!(packed.len(), 64 / 32 * 34);
+
+        let mut roundtrip = vec![0.0_f32; 64];
+        dequantize_q8_0(&packed, 64, &mut roundtrip);
+
+        let absmax = src.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let tol = absmax / 127.0;
+        for (orig, back) in src.iter().zip(roundtrip.iter()) {
+            assert!(
+                (orig - back).abs() <= tol + 1e-5,
+                "{} vs {} (tol {})", orig, back, tol
+            );
+        }
     }
 }

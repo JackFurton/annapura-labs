@@ -15,7 +15,7 @@ in later chapters.
 ```
 Chapter 0  Foundations                 ████████████████████ done
 Chapter 1  Correct slow forward pass   ████████████████████ done
-Chapter 2  Fast CPU kernels            ████████████░░░░░░░░ 2.1+2.2+2.3 done
+Chapter 2  Fast CPU kernels            ██████████████████░░ 2.1+2.2+2.3+2.5 done
 Chapter 2  Fast CPU kernels            ░░░░░░░░░░░░░░░░░░░░
 Chapter 3  Real attention (Flash, KV)  ░░░░░░░░░░░░░░░░░░░░
 Chapter 4  Serving infra               ░░░░░░░░░░░░░░░░░░░░
@@ -66,19 +66,20 @@ theoretical single-core peak:  ~128 GFLOPS
 fraction of peak achieved:     ~2-3%
 ```
 
-### Where we are now (after chapter 2.1 + 2.2 + 2.3)
+### Where we are now (after chapter 2.1 + 2.2 + 2.3 + 2.5)
 
 ```
 matmul kernel    naive 2.7 → ikj 28-36 (10× via loop reorder + auto-vec)
 linear kernel    scalar 3.0 → SIMD 17.6 → SIMD+rayon ~45 GFLOPS aggregate
-full inference   1.6 tok/s → 9 tok/s → 23 tok/s  (~15× on TinyLlama Q8_0)
+Q8 fused kernel  reads packed Q8_0 bytes directly, no f32 materialization
+                 vectorized i8→f32 widening via NEON intrinsics
+full inference   1.6 tok/s → 9 tok/s → 23 tok/s → ~36 tok/s (~23× on TinyLlama)
+startup          ~3 s → 8 ms (mmap'd packed bytes, no eager dequant)
+RAM              4.1 GB → 1.0 GB (no f32 weight materialization)
 ```
 
-Effective per-token cost: ~43 ms steady-state (was 640 ms yesterday). The
-2.55× scaling from 6 P-cores instead of an ideal 6× is the memory wall
-showing up — we're reading ~90 GB/s of weights against M3 Pro's ~150 GB/s
-unified memory bandwidth ceiling. Move 2.5 (Q8-aware kernels) is the
-direct attack on that, reading 4× less memory per matmul.
+The argmax of `generate` is bit-identical across every optimization
+(token 310 @ logit 9.693). Each move changed the kernel, not the math.
 
 The drop from 64→512 is cache hierarchy biting — the i,j,k inner loop
 strides down columns of B (stride-N), which thrashes L1 once the working
