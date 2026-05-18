@@ -74,4 +74,43 @@ impl TokenDecoder {
     pub fn decode_one_lossy(&self, token_id: usize) -> String {
         String::from_utf8_lossy(&self.decode_one_bytes(token_id)).into_owned()
     }
+
+    /// Greedy longest-prefix-match encoder. NOT proper SentencePiece BPE
+    /// (which uses learned merges/scores), but good enough for ASCII demos.
+    /// Caller is responsible for prepending BOS if the model expects it.
+    ///
+    /// Spaces in the input are converted to `▁` per the SentencePiece
+    /// convention. Falls back to `<0xNN>` byte tokens when no vocab match.
+    pub fn encode_greedy(&self, text: &str) -> Vec<usize> {
+        let normalized = text.replace(' ', "\u{2581}");
+        let bytes = normalized.as_bytes();
+        let mut tokens = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let remaining = &bytes[i..];
+            let mut best: Option<(usize, usize)> = None;
+            for (id, v) in self.vocab.iter().enumerate() {
+                let vb = v.as_bytes();
+                if !vb.is_empty() && remaining.starts_with(vb) {
+                    if best.map_or(true, |(_, l)| vb.len() > l) {
+                        best = Some((id, vb.len()));
+                    }
+                }
+            }
+            match best {
+                Some((id, len)) => {
+                    tokens.push(id);
+                    i += len;
+                }
+                None => {
+                    let bt = format!("<0x{:02X}>", bytes[i]);
+                    if let Some(id) = self.vocab.iter().position(|v| v == &bt) {
+                        tokens.push(id);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        tokens
+    }
 }

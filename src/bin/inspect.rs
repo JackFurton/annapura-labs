@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 
 use annapura::gguf::{Model, Value};
+use annapura::tokenizer::TokenDecoder;
 
 const DEFAULT_PATH: &str = "models/tinyllama-1.1b-chat-q8_0.gguf";
 
@@ -12,6 +13,7 @@ fn main() -> Result<()> {
 
     let mut path: Option<String> = None;
     let mut values: Option<(String, usize)> = None;
+    let mut find: Option<String> = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -26,6 +28,14 @@ fn main() -> Result<()> {
                 values = Some((name, n_words.unwrap_or(16)));
                 i += if n_words.is_some() { 3 } else { 2 };
             }
+            "--find" => {
+                find = Some(
+                    argv.get(i + 1)
+                        .ok_or_else(|| anyhow!("--find needs text"))?
+                        .clone(),
+                );
+                i += 2;
+            }
             other => {
                 path = Some(other.into());
                 i += 1;
@@ -36,7 +46,9 @@ fn main() -> Result<()> {
     let path: PathBuf = path.unwrap_or_else(|| DEFAULT_PATH.into()).into();
     let model = Model::load(&path)?;
 
-    if let Some((name, n)) = values {
+    if let Some(text) = find {
+        dump_find(&model, &text)
+    } else if let Some((name, n)) = values {
         dump_values(&model, &name, n)
     } else {
         dump_summary(&path, &model);
@@ -117,6 +129,31 @@ fn dump_values(model: &Model, name: &str, n: usize) -> Result<()> {
     for (i, v) in data.iter().take(n).enumerate() {
         println!("  [{:5}]  {:>+12.6}", i, v);
     }
+    Ok(())
+}
+
+fn dump_find(model: &Model, text: &str) -> Result<()> {
+    let decoder = TokenDecoder::from_model(model)?;
+    let ids = decoder.encode_greedy(text);
+    let bos = model
+        .metadata
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(Value::as_u32)
+        .unwrap_or(1) as usize;
+
+    println!("input:       {:?}", text);
+    println!("tokens ({}):", ids.len());
+    for id in &ids {
+        let decoded = decoder.decode_one_lossy(*id);
+        println!("  {:>6}  {:?}", id, decoded);
+    }
+    println!();
+    println!("feed to generate (BOS prepended):");
+    print!("  cargo run --release --bin generate -- --n 80 {}", bos);
+    for id in &ids {
+        print!(" {}", id);
+    }
+    println!();
     Ok(())
 }
 
