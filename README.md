@@ -38,6 +38,7 @@ showing what speedup it would buy us over the CPU baseline from chapters
 | `src/nn.rs` | Neural net primitives — RMSNorm, Linear, RoPE, softmax, add, mul, SiLU |
 | `src/attention.rs` | Scaled dot-product attention + KV cache (GQA-aware) |
 | `src/transformer.rs` | Config + LayerWeights + Scratch + one-layer forward |
+| `src/tokenizer.rs` | Decode-only tokenizer (vocab from GGUF metadata) |
 | `src/matmul.rs` | Matrix multiplication kernels — naive scalar baseline |
 | `src/bin/inspect.rs` | Model inspection CLI — metadata + tensor dump |
 | `src/bin/embed.rs` | Token embedding lookup demo |
@@ -107,8 +108,8 @@ cargo run --release --bin embed -- 0 1 2 100 1000
 # Diagnostic: single-layer forward pass with attention patterns
 cargo run --release --bin forward -- 1 15043 1925 338 263 8225
 
-# Full inference: 22 layers + output head → next-token prediction
-cargo run --release --bin generate -- 1 15043 1925 338 263 8225
+# Stream generated text from a prompt (decoded via the GGUF vocab)
+cargo run --release --bin generate -- --n 60 1 15043 1925 338 263 8225
 ```
 
 ## Getting the model

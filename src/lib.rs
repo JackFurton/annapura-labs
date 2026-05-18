@@ -5,6 +5,7 @@ pub mod gguf;
 pub mod matmul;
 pub mod nn;
 pub mod quant;
+pub mod tokenizer;
 pub mod transformer;
 
 pub use matmul::{matmul_blocked, matmul_ikj, matmul_naive};

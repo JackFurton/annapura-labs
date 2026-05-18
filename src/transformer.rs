@@ -21,6 +21,8 @@ pub struct Config {
     pub intermediate: usize,
     pub vocab: usize,
     pub max_seq_len: usize,
+    pub bos_token_id: usize,
+    pub eos_token_id: usize,
 }
 
 impl Config {
@@ -45,9 +47,12 @@ impl Config {
             .tensor("token_embd.weight")
             .ok_or_else(|| anyhow!("no token_embd.weight"))?
             .shape[1] as usize;
+        let bos_token_id = meta_u32(model, "tokenizer.ggml.bos_token_id")? as usize;
+        let eos_token_id = meta_u32(model, "tokenizer.ggml.eos_token_id")? as usize;
         Ok(Self {
             eps, freq_base, head_dim, n_heads, n_kv_heads, n_layers,
             hidden, kv_dim, intermediate, vocab, max_seq_len,
+            bos_token_id, eos_token_id,
         })
     }
 }
