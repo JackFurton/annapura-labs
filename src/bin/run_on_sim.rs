@@ -17,6 +17,7 @@ use annapura::accelerator::{Accelerator, MATMUL_TILE};
 use annapura::compiler::{compile_linear, retile_weight};
 use annapura::gguf::Model;
 use annapura::nn::{linear_q8_par, linear_simd_par, rmsnorm};
+use annapura::perf_model::{MIDRANGE_1G_4P, TOY_1G_1P, TRAINIUM_2G_16P};
 use annapura::transformer::Config;
 
 const DEFAULT_PATH: &str = "models/tinyllama-1.1b-chat-q8_0.gguf";
@@ -130,9 +131,35 @@ fn main() -> Result<()> {
              in_dim * out_dim, (in_dim * out_dim) as f64 / 1e6);
 
     println!();
-    println!("This is the moment chapter 5 was built for:");
-    println!("a real TinyLlama linear, computed by our hand-designed accelerator");
-    println!("simulator, agreeing with our hand-written CPU baseline.");
+    println!("=== Predicted silicon perf (chapter 5.4 perf model) ===");
+    println!("Same program, run on three hypothetical chip designs:");
+    println!();
+    let cpu_q8_ms = cpu_q8_time.as_secs_f64() * 1000.0;
+    for (model, label) in [
+        (TOY_1G_1P,        "Toy chip    (1 GHz, 1 matmul pipe) "),
+        (MIDRANGE_1G_4P,   "Mid-range   (1 GHz, 4 matmul pipes)"),
+        (TRAINIUM_2G_16P,  "Trainium-ish(2 GHz, 16 matmul pipes)"),
+    ] {
+        let cycles = model.predict_cycles(&program);
+        let predicted_ms = model.predict_ms(&program);
+        let speedup_vs_cpu_q8 = cpu_q8_ms / predicted_ms;
+        println!(
+            "  {}: {:>10} cycles  →  {:>7.2} µs  ({:>4.1}× over CPU Q8)",
+            label,
+            cycles,
+            predicted_ms * 1000.0,
+            speedup_vs_cpu_q8
+        );
+    }
+    println!();
+    println!("The scaling story: each doubling of matmul pipes ~halves cycle count.");
+    println!("Each doubling of clock ~halves wall-clock time. Multiplicatively, the");
+    println!("Trainium-class design predicts ~{:.0}× speedup over our 6-P-core CPU.",
+             cpu_q8_ms / TRAINIUM_2G_16P.predict_ms(&program));
+    println!();
+    println!("Caveat: this is a first-order latency model. Real silicon has");
+    println!("pipeline hazards, port contention, DRAM stalls, thermal limits.");
+    println!("Chapter 6 will layer a cycle-accurate microarch model on top.");
 
     Ok(())
 }
