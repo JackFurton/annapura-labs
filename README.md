@@ -16,7 +16,7 @@ in later chapters.
 Chapter 0  Foundations                 ████████████████████ done
 Chapter 1  Correct slow forward pass   ████████████████████ done
 Chapter 2  Fast CPU kernels            ██████████████████░░ 2.1+2.2+2.3+2.5 done
-Chapter 5  Accelerator simulator       ██░░░░░░░░░░░░░░░░░░ 5.0 (vector ISA skeleton)
+Chapter 5  Accelerator simulator       ████░░░░░░░░░░░░░░░░ 5.0+5.1 (vector + matmul + DRAM)
 Chapter 2  Fast CPU kernels            ░░░░░░░░░░░░░░░░░░░░
 Chapter 3  Real attention (Flash, KV)  ░░░░░░░░░░░░░░░░░░░░
 Chapter 4  Serving infra               ░░░░░░░░░░░░░░░░░░░░
