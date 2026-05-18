@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 
 use annapura::accelerator::{Accelerator, MATMUL_TILE};
-use annapura::compiler::{compile_linear, retile_weight};
+use annapura::compiler::{compile_linear, compile_rmsnorm, retile_weight};
 use annapura::gguf::Model;
 use annapura::nn::{linear_q8_par, linear_simd_par, rmsnorm};
 use annapura::perf_model::{MIDRANGE_1G_4P, TOY_1G_1P, TRAINIUM_2G_16P};
@@ -28,8 +28,8 @@ fn main() -> Result<()> {
     let cfg = Config::from_model(&model)?;
 
     println!("==========================================================");
-    println!(" Running blk.0.attn_q.weight (real TinyLlama Q-projection)");
-    println!(" through three paths and cross-checking the output.");
+    println!(" Running blk.0 (attn_norm + attn_q) — real TinyLlama RMSNorm");
+    println!(" + Q-projection through three paths and cross-checking.");
     println!("==========================================================");
     println!("dims: in={}, out={}, total MACs = {}",
              cfg.hidden, cfg.hidden, cfg.hidden * cfg.hidden);
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
     linear_q8_par(&x_normed, wq_packed, &mut y_cpu_q8);
     let cpu_q8_time = t.elapsed();
 
-    // === Path C: the simulator ===
+    // === Path C: the simulator (RMSNorm + Linear, both lowered) ===
     println!("preparing simulator input (retile Wq for tile layout)...");
     let t = Instant::now();
     let wq_tiled = retile_weight(&wq_f32, cfg.hidden, cfg.hidden);
@@ -72,24 +72,43 @@ fn main() -> Result<()> {
 
     let in_dim = cfg.hidden;
     let out_dim = cfg.hidden;
-    let sram_size = in_dim + (in_dim * out_dim) + out_dim;
-    let mut acc = Accelerator::new(sram_size, 0);
+    // SRAM layout: x_raw | gamma | x_normed | Wq_tiled | y
     let x_addr = 0;
-    let w_addr = in_dim;
+    let g_addr = x_addr + in_dim;
+    let xn_addr = g_addr + in_dim;
+    let w_addr = xn_addr + in_dim;
     let y_addr = w_addr + in_dim * out_dim;
-    acc.sram[x_addr..x_addr + in_dim].copy_from_slice(&x_normed);
+    let sram_size = y_addr + out_dim;
+    let mut acc = Accelerator::new(sram_size, 0);
+    acc.sram[x_addr..x_addr + in_dim].copy_from_slice(&x_raw);
+    acc.sram[g_addr..g_addr + in_dim].copy_from_slice(&attn_norm_w);
     acc.sram[w_addr..w_addr + in_dim * out_dim].copy_from_slice(&wq_tiled);
 
-    let program = compile_linear(in_dim, out_dim, x_addr, w_addr, y_addr);
+    let mut program = compile_rmsnorm(in_dim, cfg.eps, x_addr, g_addr, xn_addr);
+    let rmsnorm_instrs = program.len();
+    program.extend(compile_linear(in_dim, out_dim, xn_addr, w_addr, y_addr));
     let n_instr = program.len();
+    let matvec_instrs = n_instr - rmsnorm_instrs;
 
-    println!("running {} MatVecTile instructions on the simulator...", n_instr);
+    println!(
+        "running {} instructions on the simulator ({} for RMSNorm + {} for Linear)...",
+        n_instr, rmsnorm_instrs, matvec_instrs,
+    );
     let t = Instant::now();
     acc.run(&program)?;
     let sim_time = t.elapsed();
     println!("  simulator wall-clock: {:?}", sim_time);
     let mut y_sim = vec![0.0_f32; out_dim];
     y_sim.copy_from_slice(&acc.sram[y_addr..y_addr + out_dim]);
+
+    // Sanity: simulator's intermediate x_normed should also match the CPU one.
+    let mut x_normed_sim = vec![0.0_f32; in_dim];
+    x_normed_sim.copy_from_slice(&acc.sram[xn_addr..xn_addr + in_dim]);
+    let (max_xn, rms_xn) = diff_stats(&x_normed_sim, &x_normed);
+    println!(
+        "  intermediate x_normed: max diff {:.3e}, rms {:.3e} vs CPU rmsnorm",
+        max_xn, rms_xn,
+    );
     println!();
 
     // === Cross-check ===
@@ -123,9 +142,10 @@ fn main() -> Result<()> {
 
     println!();
     println!("=== Instruction breakdown ===");
-    println!("  MatVecTile dispatched: {}", n_instr);
+    println!("  RMSNorm vector ops:    {}", rmsnorm_instrs);
+    println!("  MatVecTile dispatched: {}", matvec_instrs);
     println!("  MACs per MatVecTile:   {}", MATMUL_TILE * MATMUL_TILE);
-    let total_macs = n_instr * MATMUL_TILE * MATMUL_TILE;
+    let total_macs = matvec_instrs * MATMUL_TILE * MATMUL_TILE;
     println!("  total MACs:            {} ({:.2}M)", total_macs, total_macs as f64 / 1e6);
     println!("  expected MACs (in×out):{} ({:.2}M) ✓",
              in_dim * out_dim, (in_dim * out_dim) as f64 / 1e6);

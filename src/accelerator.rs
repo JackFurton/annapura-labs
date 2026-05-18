@@ -76,6 +76,13 @@ pub enum Instruction {
     VSplat { v: u8, scalar: f32 },
     /// `vregs[v_out] = silu(vregs[v_in])` (lanewise)
     VSilu { v_in: u8, v_out: u8 },
+    /// `vregs[v_out] = [sum(vregs[v_in]); VECTOR_LANES]` — sum-of-lanes
+    /// broadcast. The horizontal reduction every real vector ISA needs for
+    /// RMSNorm / softmax. In silicon: a log-tree reduction network.
+    VReduceSum { v_in: u8, v_out: u8 },
+    /// `vregs[v_out] = 1 / sqrt(vregs[v_in])` (lanewise). Transcendental like
+    /// VSilu — modeled as a multi-cycle op on the vector pipe.
+    VRsqrt { v_in: u8, v_out: u8 },
 
     // === Matrix unit (chapter 5.1) ===
     /// Zero the matrix accumulator.
@@ -169,6 +176,18 @@ impl Accelerator {
                 for k in 0..VECTOR_LANES {
                     let x = src[k];
                     self.vregs[o][k] = x / (1.0 + (-x).exp());
+                }
+            }
+            VReduceSum { v_in, v_out } => {
+                let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
+                let sum: f32 = self.vregs[i].iter().sum();
+                self.vregs[o] = [sum; VECTOR_LANES];
+            }
+            VRsqrt { v_in, v_out } => {
+                let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
+                let src = self.vregs[i];
+                for k in 0..VECTOR_LANES {
+                    self.vregs[o][k] = 1.0 / src[k].sqrt();
                 }
             }
 
@@ -321,6 +340,31 @@ mod tests {
         acc.execute(&Instruction::VSilu { v_in: 0, v_out: 1 }).unwrap();
         for (lane, &v) in [-2.0_f32, -1.0, 0.0, 1.0, 2.0].iter().enumerate() {
             let expected = v / (1.0 + (-v).exp());
+            assert!((acc.vregs[1][lane] - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn vreduce_sum_broadcasts_total_to_all_lanes() {
+        let mut acc = new_acc(64);
+        for k in 0..VECTOR_LANES {
+            acc.vregs[0][k] = k as f32; // 0+1+...+31 = 496
+        }
+        acc.execute(&Instruction::VReduceSum { v_in: 0, v_out: 1 }).unwrap();
+        for k in 0..VECTOR_LANES {
+            assert_eq!(acc.vregs[1][k], 496.0);
+        }
+    }
+
+    #[test]
+    fn vrsqrt_lanewise() {
+        let mut acc = new_acc(64);
+        for (lane, &v) in [1.0_f32, 4.0, 16.0, 100.0].iter().enumerate() {
+            acc.vregs[0][lane] = v;
+        }
+        acc.execute(&Instruction::VRsqrt { v_in: 0, v_out: 1 }).unwrap();
+        for (lane, &v) in [1.0_f32, 4.0, 16.0, 100.0].iter().enumerate() {
+            let expected = 1.0 / v.sqrt();
             assert!((acc.vregs[1][lane] - expected).abs() < 1e-6);
         }
     }

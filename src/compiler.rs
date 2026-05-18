@@ -10,7 +10,7 @@
 //! ML accelerators (Trainium, Tensor Cores) expect data to arrive in the
 //! layout their matmul units want.
 
-use crate::accelerator::{Instruction, MATMUL_TILE, MATMUL_TILE_ELEMENTS};
+use crate::accelerator::{Instruction, MATMUL_TILE, MATMUL_TILE_ELEMENTS, VECTOR_LANES};
 
 /// Lower `y = W·x` into a sequence of `MatVecTile` instructions.
 ///
@@ -49,6 +49,58 @@ pub fn compile_linear(
                 accumulate: it != 0,
             });
         }
+    }
+    prog
+}
+
+/// Lower `y = rmsnorm(x, gamma, eps)` into vector ops.
+///
+/// `n` must be a multiple of `VECTOR_LANES` (32). At dispatch time `x` lives
+/// at `sram[x_addr..x_addr+n]`, `gamma` at `sram[gamma_addr..gamma_addr+n]`,
+/// and `y` is written to `sram[y_addr..y_addr+n]`.
+///
+/// Algorithm:
+///   1. v_acc = 0; for each 32-lane chunk: v_acc += chunk * chunk  (VFma)
+///   2. broadcast(sum(v_acc)) → all lanes hold sum-of-squares  (VReduceSum)
+///   3. v_acc *= 1/n; v_acc += eps; v_scale = rsqrt(v_acc)
+///   4. for each chunk: y_chunk = (x_chunk * v_scale) * gamma_chunk
+///
+/// Register convention: v0=acc, v1=scale, v2=tmp_const, v3=x, v4=gamma, v5=tmp
+pub fn compile_rmsnorm(
+    n: usize,
+    eps: f32,
+    x_addr: usize,
+    gamma_addr: usize,
+    y_addr: usize,
+) -> Vec<Instruction> {
+    assert_eq!(n % VECTOR_LANES, 0, "n must be a multiple of {}", VECTOR_LANES);
+    let n_chunks = n / VECTOR_LANES;
+    let mut prog: Vec<Instruction> = Vec::with_capacity(2 + n_chunks + 5 + 4 * n_chunks);
+
+    // v0 = 0  (sum-of-squares accumulator)
+    prog.push(Instruction::VSplat { v: 0, scalar: 0.0 });
+    // Pass 1: v0 += x_chunk * x_chunk for each chunk
+    for i in 0..n_chunks {
+        let off = x_addr + i * VECTOR_LANES;
+        prog.push(Instruction::LoadVec { v: 3, sram_addr: off });
+        prog.push(Instruction::VFma { a: 3, b: 3, c: 0, d: 0 });
+    }
+    // Reduce + scalar arithmetic.
+    prog.push(Instruction::VReduceSum { v_in: 0, v_out: 0 });   // sum of squares
+    prog.push(Instruction::VSplat { v: 2, scalar: 1.0 / n as f32 });
+    prog.push(Instruction::VMul { a: 0, b: 2, c: 0 });           // mean_sq
+    prog.push(Instruction::VSplat { v: 2, scalar: eps });
+    prog.push(Instruction::VAdd { a: 0, b: 2, c: 0 });           // mean_sq + eps
+    prog.push(Instruction::VRsqrt { v_in: 0, v_out: 1 });        // v1 = scale
+
+    // Pass 2: y_chunk = (x_chunk * scale) * gamma_chunk
+    for i in 0..n_chunks {
+        let off = i * VECTOR_LANES;
+        prog.push(Instruction::LoadVec { v: 3, sram_addr: x_addr + off });
+        prog.push(Instruction::LoadVec { v: 4, sram_addr: gamma_addr + off });
+        prog.push(Instruction::VMul { a: 3, b: 1, c: 5 });
+        prog.push(Instruction::VMul { a: 5, b: 4, c: 5 });
+        prog.push(Instruction::StoreVec { v: 5, sram_addr: y_addr + off });
     }
     prog
 }
@@ -167,6 +219,38 @@ mod tests {
                 (got - want).abs() < 1e-3,
                 "y[{}]: simulator {} vs CPU {} (diff {})",
                 j, got, want, (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_rmsnorm_matches_cpu_reference() {
+        let n = 256;
+        let eps = 1e-5;
+        let x = pseudo(n, 23);
+        let gamma = pseudo(n, 29);
+
+        let mut y_cpu = vec![0.0_f32; n];
+        crate::nn::rmsnorm(&x, &gamma, eps, &mut y_cpu);
+
+        let sram_size = 3 * n;
+        let mut acc = Accelerator::new(sram_size, 0);
+        let x_addr = 0;
+        let g_addr = n;
+        let y_addr = 2 * n;
+        acc.sram[x_addr..x_addr + n].copy_from_slice(&x);
+        acc.sram[g_addr..g_addr + n].copy_from_slice(&gamma);
+
+        let program = compile_rmsnorm(n, eps, x_addr, g_addr, y_addr);
+        acc.run(&program).unwrap();
+
+        for i in 0..n {
+            let got = acc.sram[y_addr + i];
+            let want = y_cpu[i];
+            assert!(
+                (got - want).abs() < 1e-4,
+                "y[{}]: simulator {} vs CPU {} (diff {})",
+                i, got, want, (got - want).abs()
             );
         }
     }

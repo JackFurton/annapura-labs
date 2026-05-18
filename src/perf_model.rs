@@ -28,8 +28,11 @@ pub fn cycle_cost(instr: &Instruction) -> u64 {
         LoadVec { .. } | StoreVec { .. } => 1,
         // Simple vector arithmetic — 1 cycle on a vector pipe.
         VAdd { .. } | VMul { .. } | VFma { .. } | VSplat { .. } => 1,
-        // Transcendental activation — needs an exp/log helper, ~8 cycles.
-        VSilu { .. } => 8,
+        // Horizontal sum-of-lanes via log-tree reduction network. log2(32)=5
+        // levels of pairwise add, but real designs pipeline this to ~4 cycles.
+        VReduceSum { .. } => 4,
+        // Transcendental ops — need an exp/log/rsqrt helper, ~8 cycles each.
+        VSilu { .. } | VRsqrt { .. } => 8,
         // Matrix accumulator ops — 1 cycle (single register write).
         MatAccumClear | MatAccumStore { .. } => 1,
         // 16×16 matmul tile — 256 MACs streamed through a 16-wide systolic
@@ -89,6 +92,8 @@ mod tests {
         assert_eq!(cycle_cost(&Instruction::LoadVec { v: 0, sram_addr: 0 }), 1);
         assert_eq!(cycle_cost(&Instruction::VSplat { v: 0, scalar: 0.0 }), 1);
         assert_eq!(cycle_cost(&Instruction::VSilu { v_in: 0, v_out: 0 }), 8);
+        assert_eq!(cycle_cost(&Instruction::VRsqrt { v_in: 0, v_out: 0 }), 8);
+        assert_eq!(cycle_cost(&Instruction::VReduceSum { v_in: 0, v_out: 0 }), 4);
         assert_eq!(
             cycle_cost(&Instruction::MatVecTile { x_sram: 0, w_sram: 0, y_sram: 0, accumulate: false }),
             16
