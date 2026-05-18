@@ -105,6 +105,84 @@ pub fn compile_rmsnorm(
     prog
 }
 
+/// Lower `c = a + b` (elementwise) into vector ops. `n` must be a multiple
+/// of `VECTOR_LANES`. Aliases are allowed (e.g. `a_addr == c_addr` for
+/// in-place residual `x += y`).
+pub fn compile_add(n: usize, a_addr: usize, b_addr: usize, c_addr: usize) -> Vec<Instruction> {
+    assert_eq!(n % VECTOR_LANES, 0, "n must be a multiple of {}", VECTOR_LANES);
+    let n_chunks = n / VECTOR_LANES;
+    let mut prog = Vec::with_capacity(n_chunks * 4);
+    for i in 0..n_chunks {
+        let off = i * VECTOR_LANES;
+        prog.push(Instruction::LoadVec { v: 0, sram_addr: a_addr + off });
+        prog.push(Instruction::LoadVec { v: 1, sram_addr: b_addr + off });
+        prog.push(Instruction::VAdd { a: 0, b: 1, c: 2 });
+        prog.push(Instruction::StoreVec { v: 2, sram_addr: c_addr + off });
+    }
+    prog
+}
+
+/// Lower `c = a * b` (elementwise) into vector ops. See `compile_add`.
+pub fn compile_mul(n: usize, a_addr: usize, b_addr: usize, c_addr: usize) -> Vec<Instruction> {
+    assert_eq!(n % VECTOR_LANES, 0, "n must be a multiple of {}", VECTOR_LANES);
+    let n_chunks = n / VECTOR_LANES;
+    let mut prog = Vec::with_capacity(n_chunks * 4);
+    for i in 0..n_chunks {
+        let off = i * VECTOR_LANES;
+        prog.push(Instruction::LoadVec { v: 0, sram_addr: a_addr + off });
+        prog.push(Instruction::LoadVec { v: 1, sram_addr: b_addr + off });
+        prog.push(Instruction::VMul { a: 0, b: 1, c: 2 });
+        prog.push(Instruction::StoreVec { v: 2, sram_addr: c_addr + off });
+    }
+    prog
+}
+
+/// Lower `out = silu(in)` (lanewise) into vector ops. In-place if
+/// `in_addr == out_addr`.
+pub fn compile_silu(n: usize, in_addr: usize, out_addr: usize) -> Vec<Instruction> {
+    assert_eq!(n % VECTOR_LANES, 0, "n must be a multiple of {}", VECTOR_LANES);
+    let n_chunks = n / VECTOR_LANES;
+    let mut prog = Vec::with_capacity(n_chunks * 3);
+    for i in 0..n_chunks {
+        let off = i * VECTOR_LANES;
+        prog.push(Instruction::LoadVec { v: 0, sram_addr: in_addr + off });
+        prog.push(Instruction::VSilu { v_in: 0, v_out: 1 });
+        prog.push(Instruction::StoreVec { v: 1, sram_addr: out_addr + off });
+    }
+    prog
+}
+
+/// Lower a SwiGLU FFN: `out = W_down · (silu(W_gate · x) ⊙ (W_up · x))`.
+///
+/// Weight layouts: all three matrices must already be re-tiled by
+/// `retile_weight`. `W_gate` and `W_up` are `[ffn_hidden, hidden]` matrices,
+/// `W_down` is `[hidden, ffn_hidden]`. `gate_buf` and `up_buf` are scratch
+/// regions of size `ffn_hidden` each.
+///
+/// Program shape: 3× compile_linear + compile_silu + compile_mul. All
+/// composition, no new ISA — the simulator already has every primitive needed
+/// for the entire FFN block.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_ffn(
+    hidden: usize,
+    ffn_hidden: usize,
+    x_addr: usize,
+    w_gate_addr: usize,
+    w_up_addr: usize,
+    w_down_addr: usize,
+    gate_buf_addr: usize,
+    up_buf_addr: usize,
+    out_addr: usize,
+) -> Vec<Instruction> {
+    let mut prog = Vec::new();
+    prog.extend(compile_linear(hidden, ffn_hidden, x_addr, w_gate_addr, gate_buf_addr));
+    prog.extend(compile_linear(hidden, ffn_hidden, x_addr, w_up_addr, up_buf_addr));
+    prog.extend(compile_silu(ffn_hidden, gate_buf_addr, gate_buf_addr));
+    prog.extend(compile_mul(ffn_hidden, gate_buf_addr, up_buf_addr, gate_buf_addr));
+    prog.extend(compile_linear(ffn_hidden, hidden, gate_buf_addr, w_down_addr, out_addr));
+    prog
+}
+
 /// Re-layout a row-major `[out_dim, in_dim]` weight matrix into the tiled
 /// layout expected by `compile_linear` / `MatVecTile`.
 ///
@@ -249,6 +327,125 @@ mod tests {
             let want = y_cpu[i];
             assert!(
                 (got - want).abs() < 1e-4,
+                "y[{}]: simulator {} vs CPU {} (diff {})",
+                i, got, want, (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn compile_add_matches_cpu() {
+        let n = 64;
+        let a = pseudo(n, 41);
+        let b = pseudo(n, 43);
+        let mut acc = Accelerator::new(3 * n, 0);
+        acc.sram[0..n].copy_from_slice(&a);
+        acc.sram[n..2 * n].copy_from_slice(&b);
+        acc.run(&compile_add(n, 0, n, 2 * n)).unwrap();
+        for i in 0..n {
+            let want = a[i] + b[i];
+            assert!((acc.sram[2 * n + i] - want).abs() < 1e-6, "i={}", i);
+        }
+    }
+
+    #[test]
+    fn compile_add_in_place_aliasing_works() {
+        // a_addr == c_addr: residual-style x += y.
+        let n = 32;
+        let a = pseudo(n, 47);
+        let b = pseudo(n, 53);
+        let mut acc = Accelerator::new(2 * n, 0);
+        acc.sram[0..n].copy_from_slice(&a);
+        acc.sram[n..2 * n].copy_from_slice(&b);
+        acc.run(&compile_add(n, 0, n, 0)).unwrap();
+        for i in 0..n {
+            let want = a[i] + b[i];
+            assert!((acc.sram[i] - want).abs() < 1e-6, "i={}", i);
+        }
+    }
+
+    #[test]
+    fn compile_mul_matches_cpu() {
+        let n = 64;
+        let a = pseudo(n, 59);
+        let b = pseudo(n, 61);
+        let mut acc = Accelerator::new(3 * n, 0);
+        acc.sram[0..n].copy_from_slice(&a);
+        acc.sram[n..2 * n].copy_from_slice(&b);
+        acc.run(&compile_mul(n, 0, n, 2 * n)).unwrap();
+        for i in 0..n {
+            let want = a[i] * b[i];
+            assert!((acc.sram[2 * n + i] - want).abs() < 1e-6, "i={}", i);
+        }
+    }
+
+    #[test]
+    fn compile_silu_matches_cpu() {
+        let n = 64;
+        let mut x_cpu = pseudo(n, 67);
+        let mut acc = Accelerator::new(2 * n, 0);
+        acc.sram[0..n].copy_from_slice(&x_cpu);
+        acc.run(&compile_silu(n, 0, n)).unwrap();
+        crate::nn::silu_in_place(&mut x_cpu);
+        for i in 0..n {
+            assert!((acc.sram[n + i] - x_cpu[i]).abs() < 1e-6, "i={}", i);
+        }
+    }
+
+    /// The big composite test: lower a full SwiGLU FFN and verify it agrees
+    /// with the CPU reference, end to end. Uses small synthetic sizes
+    /// (hidden=64, ffn_hidden=128) so the test is fast.
+    #[test]
+    fn end_to_end_ffn_matches_cpu_reference() {
+        let hidden = 64;
+        let ffn_hidden = 128;
+        let x = pseudo(hidden, 71);
+        let w_gate = pseudo(hidden * ffn_hidden, 73);
+        let w_up = pseudo(hidden * ffn_hidden, 79);
+        let w_down = pseudo(ffn_hidden * hidden, 83);
+
+        // CPU reference: gate -> silu -> mul up -> down.
+        let mut gate_cpu = vec![0.0_f32; ffn_hidden];
+        let mut up_cpu = vec![0.0_f32; ffn_hidden];
+        crate::nn::linear(&x, &w_gate, &mut gate_cpu);
+        crate::nn::linear(&x, &w_up, &mut up_cpu);
+        crate::nn::silu_in_place(&mut gate_cpu);
+        crate::nn::mul_in_place(&mut gate_cpu, &up_cpu);
+        let mut y_cpu = vec![0.0_f32; hidden];
+        crate::nn::linear(&gate_cpu, &w_down, &mut y_cpu);
+
+        // Simulator path: retile all three weight matrices, set up SRAM, run.
+        let wg_tiled = retile_weight(&w_gate, hidden, ffn_hidden);
+        let wu_tiled = retile_weight(&w_up, hidden, ffn_hidden);
+        let wd_tiled = retile_weight(&w_down, ffn_hidden, hidden);
+
+        let x_addr = 0;
+        let wg_addr = x_addr + hidden;
+        let wu_addr = wg_addr + hidden * ffn_hidden;
+        let wd_addr = wu_addr + hidden * ffn_hidden;
+        let gate_addr = wd_addr + ffn_hidden * hidden;
+        let up_addr = gate_addr + ffn_hidden;
+        let out_addr = up_addr + ffn_hidden;
+        let sram_size = out_addr + hidden;
+
+        let mut acc = Accelerator::new(sram_size, 0);
+        acc.sram[x_addr..x_addr + hidden].copy_from_slice(&x);
+        acc.sram[wg_addr..wg_addr + hidden * ffn_hidden].copy_from_slice(&wg_tiled);
+        acc.sram[wu_addr..wu_addr + hidden * ffn_hidden].copy_from_slice(&wu_tiled);
+        acc.sram[wd_addr..wd_addr + ffn_hidden * hidden].copy_from_slice(&wd_tiled);
+
+        let program = compile_ffn(
+            hidden, ffn_hidden,
+            x_addr, wg_addr, wu_addr, wd_addr,
+            gate_addr, up_addr, out_addr,
+        );
+        acc.run(&program).unwrap();
+
+        for i in 0..hidden {
+            let got = acc.sram[out_addr + i];
+            let want = y_cpu[i];
+            assert!(
+                (got - want).abs() < 1e-3,
                 "y[{}]: simulator {} vs CPU {} (diff {})",
                 i, got, want, (got - want).abs()
             );
