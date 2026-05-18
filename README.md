@@ -16,6 +16,7 @@ in later chapters.
 Chapter 0  Foundations                 ████████████████████ done
 Chapter 1  Correct slow forward pass   ████████████████████ done
 Chapter 2  Fast CPU kernels            ██████████████████░░ 2.1+2.2+2.3+2.5 done
+Chapter 5  Accelerator simulator       ██░░░░░░░░░░░░░░░░░░ 5.0 (vector ISA skeleton)
 Chapter 2  Fast CPU kernels            ░░░░░░░░░░░░░░░░░░░░
 Chapter 3  Real attention (Flash, KV)  ░░░░░░░░░░░░░░░░░░░░
 Chapter 4  Serving infra               ░░░░░░░░░░░░░░░░░░░░
@@ -39,6 +40,8 @@ showing what speedup it would buy us over the CPU baseline from chapters
 | `src/attention.rs` | Scaled dot-product attention + KV cache (GQA-aware) |
 | `src/transformer.rs` | Config + LayerWeights + Scratch + one-layer forward |
 | `src/tokenizer.rs` | Decode-only tokenizer (vocab from GGUF metadata) |
+| `src/accelerator.rs` | Toy ML accelerator — vector machine + SRAM (functional sim) |
+| `src/bin/roofline.rs` | Roofline analysis — quantitative chapter-5 motivation |
 | `src/matmul.rs` | Matrix multiplication kernels — naive scalar baseline |
 | `src/bin/inspect.rs` | Model inspection CLI — metadata + tensor dump |
 | `src/bin/embed.rs` | Token embedding lookup demo |

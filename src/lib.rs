@@ -1,5 +1,6 @@
 //! Annapura: from-scratch ML systems / accelerator co-design hack project.
 
+pub mod accelerator;
 pub mod attention;
 pub mod gguf;
 pub mod matmul;
