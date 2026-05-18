@@ -85,6 +85,19 @@ pub enum Instruction {
     MatMulTile { a_sram: usize, b_sram: usize },
     /// `SRAM[dst .. dst + 256] = matrix_accum` (row-major).
     MatAccumStore { sram_dst: usize },
+    /// Matrix-vector tile (the matvec primitive — what `compile_linear` emits).
+    /// Reads 16 elements of x at `x_sram`, a tiled 16×16 weight block at
+    /// `w_sram` (laid out so `w_sram[k*16 + j]` = original `W[output_tile + j][input_tile + k]`),
+    /// and accumulates the 16-element matvec result into `y_sram[0..16]`.
+    /// `accumulate = false` overwrites; `accumulate = true` adds.
+    /// This is the primitive used to lower a Llama linear; 16,384 of these
+    /// dispatched in sequence cover a 2048×2048 Q-projection.
+    MatVecTile {
+        x_sram: usize,
+        w_sram: usize,
+        y_sram: usize,
+        accumulate: bool,
+    },
 
     // === Host transfers (chapter 5.1) ===
     /// `SRAM[sram_addr .. sram_addr + len] = DRAM[dram_addr .. dram_addr + len]`
@@ -187,6 +200,22 @@ impl Accelerator {
                     for j in 0..MATMUL_TILE {
                         self.sram[sram_dst + i * MATMUL_TILE + j] = self.matrix_accum[i][j];
                     }
+                }
+            }
+            MatVecTile { x_sram, w_sram, y_sram, accumulate } => {
+                let _ = checked_end(x_sram, MATMUL_TILE, self.sram.len(), "SRAM (MatVec X)")?;
+                let _ = checked_end(w_sram, MATMUL_TILE_ELEMENTS, self.sram.len(), "SRAM (MatVec W)")?;
+                let _ = checked_end(y_sram, MATMUL_TILE, self.sram.len(), "SRAM (MatVec Y)")?;
+
+                let mut x_buf = [0.0_f32; MATMUL_TILE];
+                x_buf.copy_from_slice(&self.sram[x_sram..x_sram + MATMUL_TILE]);
+
+                for j in 0..MATMUL_TILE {
+                    let mut acc = if accumulate { self.sram[y_sram + j] } else { 0.0 };
+                    for k in 0..MATMUL_TILE {
+                        acc += x_buf[k] * self.sram[w_sram + k * MATMUL_TILE + j];
+                    }
+                    self.sram[y_sram + j] = acc;
                 }
             }
 
@@ -439,5 +468,72 @@ mod tests {
         assert!(acc
             .execute(&Instruction::LoadDram { dram_addr: 50, sram_addr: 0, len: 32 })
             .is_err());
+    }
+
+    // ===== MatVecTile tests =====
+
+    #[test]
+    fn matvec_tile_identity_passes_x_through() {
+        let mut acc = new_acc(MATMUL_TILE_ELEMENTS * 2 + MATMUL_TILE * 4);
+        // x = [0.5, 1.0, 1.5, ...] at sram[0..16]
+        for i in 0..MATMUL_TILE {
+            acc.sram[i] = (i as f32 + 1.0) * 0.5;
+        }
+        // W tile = identity at sram[16..16+256]
+        // For matvec semantics, tile[k][j] = 1 if k==j else 0 reproduces y = x.
+        for k in 0..MATMUL_TILE {
+            acc.sram[MATMUL_TILE + k * MATMUL_TILE + k] = 1.0;
+        }
+        let y_addr = MATMUL_TILE + MATMUL_TILE_ELEMENTS;
+        acc.execute(&Instruction::MatVecTile {
+            x_sram: 0,
+            w_sram: MATMUL_TILE,
+            y_sram: y_addr,
+            accumulate: false,
+        })
+        .unwrap();
+        for i in 0..MATMUL_TILE {
+            assert_eq!(acc.sram[y_addr + i], (i as f32 + 1.0) * 0.5);
+        }
+    }
+
+    #[test]
+    fn matvec_tile_accumulates_on_second_call() {
+        let mut acc = new_acc(MATMUL_TILE * 4 + MATMUL_TILE_ELEMENTS * 2);
+        for i in 0..MATMUL_TILE {
+            acc.sram[i] = 1.0; // x = ones
+            acc.sram[MATMUL_TILE + i * MATMUL_TILE + i] = 1.0; // tile = identity
+        }
+        let y_addr = MATMUL_TILE + MATMUL_TILE_ELEMENTS;
+        acc.execute(&Instruction::MatVecTile {
+            x_sram: 0, w_sram: MATMUL_TILE, y_sram: y_addr, accumulate: false,
+        }).unwrap();
+        acc.execute(&Instruction::MatVecTile {
+            x_sram: 0, w_sram: MATMUL_TILE, y_sram: y_addr, accumulate: true,
+        }).unwrap();
+        for i in 0..MATMUL_TILE {
+            assert_eq!(acc.sram[y_addr + i], 2.0);
+        }
+    }
+
+    #[test]
+    fn matvec_tile_accumulate_false_resets_y() {
+        // If accumulate=false, prior contents of y should be ignored.
+        let mut acc = new_acc(MATMUL_TILE * 4 + MATMUL_TILE_ELEMENTS * 2);
+        for i in 0..MATMUL_TILE {
+            acc.sram[i] = 1.0;
+            acc.sram[MATMUL_TILE + i * MATMUL_TILE + i] = 1.0;
+        }
+        let y_addr = MATMUL_TILE + MATMUL_TILE_ELEMENTS;
+        // Poison y with garbage; the first MatVec should overwrite it.
+        for i in 0..MATMUL_TILE {
+            acc.sram[y_addr + i] = 99999.0;
+        }
+        acc.execute(&Instruction::MatVecTile {
+            x_sram: 0, w_sram: MATMUL_TILE, y_sram: y_addr, accumulate: false,
+        }).unwrap();
+        for i in 0..MATMUL_TILE {
+            assert_eq!(acc.sram[y_addr + i], 1.0);
+        }
     }
 }

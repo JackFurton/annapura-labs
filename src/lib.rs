@@ -2,6 +2,7 @@
 
 pub mod accelerator;
 pub mod attention;
+pub mod compiler;
 pub mod gguf;
 pub mod matmul;
 pub mod nn;
