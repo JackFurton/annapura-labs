@@ -152,6 +152,78 @@ pub fn compile_silu(n: usize, in_addr: usize, out_addr: usize) -> Vec<Instructio
     prog
 }
 
+/// Build the cos / signed-sin tables that `compile_rope` expects in SRAM.
+///
+/// Returns `(cos_table, sin_pm_table)`, each `head_dim` floats. The layout
+/// matches what the lowering loop reads: chunk `c` of either table sits at
+/// offset `c * VECTOR_LANES`. Within a chunk, both lanes of each pair hold
+/// the same cosine; the sin table interleaves `(-s, +s)` so that one
+/// `VMul + VFma` produces the rotated pair without extra sign handling.
+///
+/// Convention: interleaved pairs `(x[2i], x[2i+1])`, the same as
+/// `nn::rope_inplace` / llama.cpp.
+pub fn build_rope_tables(head_dim: usize, pos: usize, freq_base: f32) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(head_dim % VECTOR_LANES, 0, "head_dim must be a multiple of {}", VECTOR_LANES);
+    assert!(head_dim % 2 == 0, "head_dim must be even");
+    let chunks_per_head = head_dim / VECTOR_LANES;
+    let pairs_per_chunk = VECTOR_LANES / 2;
+    let mut cos = vec![0.0_f32; head_dim];
+    let mut sin_pm = vec![0.0_f32; head_dim];
+    let pos = pos as f32;
+    for c in 0..chunks_per_head {
+        for p in 0..pairs_per_chunk {
+            let pair_idx = c * pairs_per_chunk + p; // index of this pair within the head
+            let omega = freq_base.powf(-2.0 * pair_idx as f32 / head_dim as f32);
+            let (s, co) = (pos * omega).sin_cos();
+            let base = c * VECTOR_LANES + 2 * p;
+            cos[base] = co;
+            cos[base + 1] = co;
+            sin_pm[base] = -s;
+            sin_pm[base + 1] = s;
+        }
+    }
+    (cos, sin_pm)
+}
+
+/// Lower RoPE (rotary position embedding) over a multi-head vector.
+///
+/// In place: writes the rotated values back to `x_addr`. `n` must be a
+/// multiple of `head_dim`, and `head_dim` a multiple of `VECTOR_LANES`. The
+/// cos / sin tables must already live at `cos_addr` / `sin_pm_addr`,
+/// produced by `build_rope_tables` for the desired `(pos, freq_base)`.
+///
+/// Per-chunk recipe (7 instructions): load x, load cos, load sin_pm,
+/// swap_pairs(x), x*cos, fma(swap, sin_pm, x*cos), store. The
+/// signed-sin table absorbs the (a·c - b·s, a·s + b·c) sign pattern so the
+/// math reduces to one lanewise multiply-add.
+pub fn compile_rope(
+    n: usize,
+    head_dim: usize,
+    x_addr: usize,
+    cos_addr: usize,
+    sin_pm_addr: usize,
+) -> Vec<Instruction> {
+    assert_eq!(n % head_dim, 0, "n must be a multiple of head_dim");
+    assert_eq!(head_dim % VECTOR_LANES, 0, "head_dim must be a multiple of {}", VECTOR_LANES);
+    let n_chunks = n / VECTOR_LANES;
+    let chunks_per_head = head_dim / VECTOR_LANES;
+    let mut prog = Vec::with_capacity(n_chunks * 7);
+
+    for chunk in 0..n_chunks {
+        let chunk_in_head = chunk % chunks_per_head;
+        let x_off = chunk * VECTOR_LANES;
+        let table_off = chunk_in_head * VECTOR_LANES;
+        prog.push(Instruction::LoadVec { v: 0, sram_addr: x_addr + x_off });
+        prog.push(Instruction::LoadVec { v: 1, sram_addr: cos_addr + table_off });
+        prog.push(Instruction::LoadVec { v: 2, sram_addr: sin_pm_addr + table_off });
+        prog.push(Instruction::VSwapPairs { v_in: 0, v_out: 3 });
+        prog.push(Instruction::VMul { a: 0, b: 1, c: 4 });
+        prog.push(Instruction::VFma { a: 3, b: 2, c: 4, d: 5 });
+        prog.push(Instruction::StoreVec { v: 5, sram_addr: x_addr + x_off });
+    }
+    prog
+}
+
 /// Lower a SwiGLU FFN: `out = W_down · (silu(W_gate · x) ⊙ (W_up · x))`.
 ///
 /// Weight layouts: all three matrices must already be re-tiled by
@@ -389,6 +461,101 @@ mod tests {
         crate::nn::silu_in_place(&mut x_cpu);
         for i in 0..n {
             assert!((acc.sram[n + i] - x_cpu[i]).abs() < 1e-6, "i={}", i);
+        }
+    }
+
+    /// Lowering matches CPU `rope_inplace` on a single 64-element head at a
+    /// non-zero position — the basic correctness check.
+    #[test]
+    fn compile_rope_single_head_matches_cpu() {
+        let head_dim = 64;
+        let pos = 17;
+        let freq_base = 10000.0;
+        let mut x_cpu = pseudo(head_dim, 89);
+        let x_sim_input = x_cpu.clone();
+
+        crate::nn::rope_inplace(&mut x_cpu, pos, freq_base);
+
+        let (cos, sin_pm) = build_rope_tables(head_dim, pos, freq_base);
+        let x_addr = 0;
+        let cos_addr = head_dim;
+        let sin_addr = cos_addr + head_dim;
+        let sram_size = sin_addr + head_dim;
+        let mut acc = Accelerator::new(sram_size, 0);
+        acc.sram[x_addr..x_addr + head_dim].copy_from_slice(&x_sim_input);
+        acc.sram[cos_addr..cos_addr + head_dim].copy_from_slice(&cos);
+        acc.sram[sin_addr..sin_addr + head_dim].copy_from_slice(&sin_pm);
+
+        let program = compile_rope(head_dim, head_dim, x_addr, cos_addr, sin_addr);
+        acc.run(&program).unwrap();
+
+        for i in 0..head_dim {
+            let got = acc.sram[x_addr + i];
+            let want = x_cpu[i];
+            assert!(
+                (got - want).abs() < 1e-5,
+                "rope[{}]: simulator {} vs CPU {} (diff {})",
+                i, got, want, (got - want).abs()
+            );
+        }
+    }
+
+    /// Multi-head: matches CPU `rope_heads` across 8 heads of dim 64 (similar
+    /// to TinyLlama Q's [32 heads × 64 head_dim] structure, scaled down).
+    #[test]
+    fn compile_rope_multi_head_matches_cpu() {
+        let head_dim = 64;
+        let n_heads = 8;
+        let n = head_dim * n_heads;
+        let pos = 23;
+        let freq_base = 10000.0;
+        let mut x_cpu = pseudo(n, 97);
+        let x_sim_input = x_cpu.clone();
+
+        crate::nn::rope_heads(&mut x_cpu, head_dim, pos, freq_base);
+
+        let (cos, sin_pm) = build_rope_tables(head_dim, pos, freq_base);
+        let x_addr = 0;
+        let cos_addr = n;
+        let sin_addr = cos_addr + head_dim;
+        let sram_size = sin_addr + head_dim;
+        let mut acc = Accelerator::new(sram_size, 0);
+        acc.sram[x_addr..x_addr + n].copy_from_slice(&x_sim_input);
+        acc.sram[cos_addr..cos_addr + head_dim].copy_from_slice(&cos);
+        acc.sram[sin_addr..sin_addr + head_dim].copy_from_slice(&sin_pm);
+
+        let program = compile_rope(n, head_dim, x_addr, cos_addr, sin_addr);
+        acc.run(&program).unwrap();
+
+        for i in 0..n {
+            let got = acc.sram[x_addr + i];
+            let want = x_cpu[i];
+            assert!(
+                (got - want).abs() < 1e-5,
+                "rope[{}] (head {}, lane {}): simulator {} vs CPU {} (diff {})",
+                i, i / head_dim, i % head_dim, got, want, (got - want).abs()
+            );
+        }
+    }
+
+    /// Position 0 is the identity rotation — sanity check that the table
+    /// builder produces cos=1, sin=0 and the lowering passes x through.
+    #[test]
+    fn compile_rope_at_position_zero_is_identity() {
+        let head_dim = 32;
+        let x = pseudo(head_dim, 101);
+        let (cos, sin_pm) = build_rope_tables(head_dim, 0, 10000.0);
+        let x_addr = 0;
+        let cos_addr = head_dim;
+        let sin_addr = cos_addr + head_dim;
+        let mut acc = Accelerator::new(sin_addr + head_dim, 0);
+        acc.sram[x_addr..x_addr + head_dim].copy_from_slice(&x);
+        acc.sram[cos_addr..cos_addr + head_dim].copy_from_slice(&cos);
+        acc.sram[sin_addr..sin_addr + head_dim].copy_from_slice(&sin_pm);
+        let program = compile_rope(head_dim, head_dim, x_addr, cos_addr, sin_addr);
+        acc.run(&program).unwrap();
+        for i in 0..head_dim {
+            assert!((acc.sram[x_addr + i] - x[i]).abs() < 1e-6, "i={}", i);
         }
     }
 

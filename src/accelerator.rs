@@ -83,6 +83,10 @@ pub enum Instruction {
     /// `vregs[v_out] = 1 / sqrt(vregs[v_in])` (lanewise). Transcendental like
     /// VSilu — modeled as a multi-cycle op on the vector pipe.
     VRsqrt { v_in: u8, v_out: u8 },
+    /// Swap adjacent lane pairs: lanes (2k, 2k+1) ↔ (2k+1, 2k). Cheap shuffle
+    /// in silicon (NEON `vrev64`, AVX `vpshufd`). Needed for interleaved-pair
+    /// RoPE, where the cross-term in the 2D rotation pulls the swapped vector.
+    VSwapPairs { v_in: u8, v_out: u8 },
 
     // === Matrix unit (chapter 5.1) ===
     /// Zero the matrix accumulator.
@@ -188,6 +192,14 @@ impl Accelerator {
                 let src = self.vregs[i];
                 for k in 0..VECTOR_LANES {
                     self.vregs[o][k] = 1.0 / src[k].sqrt();
+                }
+            }
+            VSwapPairs { v_in, v_out } => {
+                let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
+                let src = self.vregs[i];
+                for k in 0..VECTOR_LANES / 2 {
+                    self.vregs[o][2 * k] = src[2 * k + 1];
+                    self.vregs[o][2 * k + 1] = src[2 * k];
                 }
             }
 
@@ -353,6 +365,19 @@ mod tests {
         acc.execute(&Instruction::VReduceSum { v_in: 0, v_out: 1 }).unwrap();
         for k in 0..VECTOR_LANES {
             assert_eq!(acc.vregs[1][k], 496.0);
+        }
+    }
+
+    #[test]
+    fn vswap_pairs_swaps_adjacent_lanes() {
+        let mut acc = new_acc(64);
+        for k in 0..VECTOR_LANES {
+            acc.vregs[0][k] = k as f32;
+        }
+        acc.execute(&Instruction::VSwapPairs { v_in: 0, v_out: 1 }).unwrap();
+        for k in 0..VECTOR_LANES / 2 {
+            assert_eq!(acc.vregs[1][2 * k], (2 * k + 1) as f32);
+            assert_eq!(acc.vregs[1][2 * k + 1], (2 * k) as f32);
         }
     }
 

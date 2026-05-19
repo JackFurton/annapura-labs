@@ -26,8 +26,8 @@ pub fn cycle_cost(instr: &Instruction) -> u64 {
     match instr {
         // Vector load/store from SRAM — 1 cycle, pipelined.
         LoadVec { .. } | StoreVec { .. } => 1,
-        // Simple vector arithmetic — 1 cycle on a vector pipe.
-        VAdd { .. } | VMul { .. } | VFma { .. } | VSplat { .. } => 1,
+        // Simple vector arithmetic + lane shuffle — 1 cycle on a vector pipe.
+        VAdd { .. } | VMul { .. } | VFma { .. } | VSplat { .. } | VSwapPairs { .. } => 1,
         // Horizontal sum-of-lanes via log-tree reduction network. log2(32)=5
         // levels of pairwise add, but real designs pipeline this to ~4 cycles.
         VReduceSum { .. } => 4,
@@ -94,6 +94,7 @@ mod tests {
         assert_eq!(cycle_cost(&Instruction::VSilu { v_in: 0, v_out: 0 }), 8);
         assert_eq!(cycle_cost(&Instruction::VRsqrt { v_in: 0, v_out: 0 }), 8);
         assert_eq!(cycle_cost(&Instruction::VReduceSum { v_in: 0, v_out: 0 }), 4);
+        assert_eq!(cycle_cost(&Instruction::VSwapPairs { v_in: 0, v_out: 0 }), 1);
         assert_eq!(
             cycle_cost(&Instruction::MatVecTile { x_sram: 0, w_sram: 0, y_sram: 0, accumulate: false }),
             16
