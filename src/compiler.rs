@@ -378,60 +378,79 @@ pub fn broadcast_q(q: &[f32]) -> Vec<f32> {
 }
 
 /// Pack `seq_len` cached K vectors (each `head_dim` long) into the
-/// transposed lane-parallel layout `compile_attention_head` reads. Output is
-/// `head_dim * VECTOR_LANES` floats: `out[d * VECTOR_LANES + p] = k[p][d]`,
-/// with lanes `p ≥ seq_len` filled with zero (their scores will be masked
-/// to `-inf` before softmax, so the zero placeholders never reach the
-/// weighted-V sum).
+/// transposed lane-parallel layout `compile_attention_head` reads.
 ///
-/// `seq_len` must be ≤ `VECTOR_LANES` (32). Caller passes K as a flat
-/// `[seq_len, head_dim]` row-major buffer (the same layout as `KvCache.k`
-/// for one kv head).
+/// Layout: for each head component `d`, `n_p_chunks` consecutive 32-lane
+/// vectors, with position-chunk `pc` and lane `lane` mapping to:
+///   `out[d * n_p_chunks * VECTOR_LANES + pc * VECTOR_LANES + lane]`
+///     = `k[p * head_dim + d]`  where `p = pc * VECTOR_LANES + lane`.
+/// Lanes beyond `seq_len` in the last chunk are zero — the additive mask
+/// pushes their scores to `-inf` before softmax, so they contribute nothing.
+///
+/// `n_p_chunks = ceil(seq_len / VECTOR_LANES)`. Total size:
+/// `head_dim * n_p_chunks * VECTOR_LANES` floats.
 pub fn transpose_k_for_lanes(k: &[f32], seq_len: usize, head_dim: usize) -> Vec<f32> {
-    assert!(seq_len <= VECTOR_LANES);
+    assert!(seq_len > 0);
     assert_eq!(k.len(), seq_len * head_dim);
-    let mut out = vec![0.0_f32; head_dim * VECTOR_LANES];
+    let n_p_chunks = seq_len.div_ceil(VECTOR_LANES);
+    let stride = n_p_chunks * VECTOR_LANES;
+    let mut out = vec![0.0_f32; head_dim * stride];
     for p in 0..seq_len {
+        let pc = p / VECTOR_LANES;
+        let lane = p % VECTOR_LANES;
         for d in 0..head_dim {
-            out[d * VECTOR_LANES + p] = k[p * head_dim + d];
+            out[d * stride + pc * VECTOR_LANES + lane] = k[p * head_dim + d];
         }
     }
     out
 }
 
-/// Build the per-lane additive softmax mask: 0.0 for valid positions
-/// `[0, seq_len)`, `-1e30` for the padded suffix. Added to the score vector
-/// before softmax so padding lanes contribute zero probability mass.
+/// Build the per-lane additive softmax mask laid out across position
+/// chunks: 0.0 for valid positions `[0, seq_len)`, `-1e30` for the padded
+/// tail of the last chunk. Length: `n_p_chunks * VECTOR_LANES`.
+///
+/// `compile_attention_head` adds chunk `pc` to its score chunk `pc` before
+/// softmax. Most chunks see an all-zero mask; only the last chunk pushes
+/// padded positions to `-inf` so they're zeroed by the subtract-max trick.
 pub fn attention_mask(seq_len: usize) -> Vec<f32> {
-    assert!(seq_len <= VECTOR_LANES);
-    let mut m = vec![0.0_f32; VECTOR_LANES];
-    for lane in seq_len..VECTOR_LANES {
+    assert!(seq_len > 0);
+    let n_p_chunks = seq_len.div_ceil(VECTOR_LANES);
+    let total = n_p_chunks * VECTOR_LANES;
+    let mut m = vec![0.0_f32; total];
+    for lane in seq_len..total {
         m[lane] = -1e30;
     }
     m
 }
 
 /// Lower scaled dot-product attention for one query head with `seq_len`
-/// cached positions (`seq_len ≤ VECTOR_LANES`).
+/// cached positions. Handles arbitrary `seq_len ≥ 1` by chunking the
+/// position dimension into 32-lane vectors.
 ///
 /// SRAM contract (all addresses contiguous regions of f32):
 ///   - `q_broadcast_addr`: `head_dim * VECTOR_LANES` floats, from `broadcast_q`
-///   - `k_t_addr`:         `head_dim * VECTOR_LANES` floats, from `transpose_k_for_lanes`
-///   - `v_addr`:           `seq_len * head_dim` floats (one row per cached position)
-///   - `mask_addr`:        `VECTOR_LANES` floats, from `attention_mask(seq_len)`
-///   - `scores_addr`:      `VECTOR_LANES` scratch floats (overwritten)
+///   - `k_t_addr`:         `head_dim * n_p_chunks * VECTOR_LANES` floats,
+///                         from `transpose_k_for_lanes`
+///   - `v_addr`:           `seq_len * head_dim` floats (one row per position)
+///   - `mask_addr`:        `n_p_chunks * VECTOR_LANES` floats,
+///                         from `attention_mask(seq_len)`
+///   - `scores_addr`:      `n_p_chunks * VECTOR_LANES` scratch floats
 ///   - `out_addr`:         `head_dim` floats (the per-head output)
 ///
-/// `head_dim` must be a multiple of `VECTOR_LANES`. `inv_sqrt_d = 1 /
-/// sqrt(head_dim)` is the standard attention scale.
+/// where `n_p_chunks = ceil(seq_len / VECTOR_LANES)`. `head_dim` must be a
+/// multiple of `VECTOR_LANES`. `inv_sqrt_d = 1 / sqrt(head_dim)` is the
+/// standard attention scale.
 ///
 /// Program shape:
-///   Phase A — scores: head_dim FMAs over (q_broadcast[d], k_t[d]) into one
-///             accumulator vector; one scale by inv_sqrt_d.
-///   Phase B — masked softmax: store the score vector, run compile_softmax
-///             over the masked scores in-place.
-///   Phase C — weighted V sum: per d_chunk, accumulate
-///             `Σ_p VBroadcastLane(scores, p) * V[p][d_chunk]` and store.
+///   Phase A — scores: for each position chunk `pc`, accumulate `head_dim`
+///             FMAs over (q_broadcast[d], k_t[d][pc]) into one 32-lane
+///             score accumulator. Scale by inv_sqrt_d, add the masked
+///             lanes, store the chunk to `scores_addr + pc * 32`.
+///   Phase B — softmax: in-place over the full `n_p_chunks * 32` scores
+///             via `compile_softmax` (which dispatches single vs chunked).
+///   Phase C — weighted V sum: per d_chunk, for each position chunk pc
+///             reload the score chunk once and inner-loop over the valid
+///             lanes — `VBroadcastLane(scores_pc, lane)` × `V[p][d_chunk]`.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_attention_head(
     head_dim: usize,
@@ -445,43 +464,59 @@ pub fn compile_attention_head(
     inv_sqrt_d: f32,
 ) -> Vec<Instruction> {
     assert_eq!(head_dim % VECTOR_LANES, 0, "head_dim must be a multiple of {}", VECTOR_LANES);
-    assert!(seq_len > 0 && seq_len <= VECTOR_LANES);
+    assert!(seq_len > 0);
+    let n_p_chunks = seq_len.div_ceil(VECTOR_LANES);
+    let k_t_stride = n_p_chunks * VECTOR_LANES;
     let d_chunks = head_dim / VECTOR_LANES;
     let mut prog: Vec<Instruction> = Vec::new();
 
-    // Phase A: lane-parallel scores. Lane p of v_acc holds (q · k_p).
-    prog.push(Instruction::VSplat { v: 10, scalar: 0.0 });        // v10 = score accumulator
-    for d in 0..head_dim {
-        prog.push(Instruction::LoadVec { v: 11, sram_addr: q_broadcast_addr + d * VECTOR_LANES });
-        prog.push(Instruction::LoadVec { v: 12, sram_addr: k_t_addr + d * VECTOR_LANES });
-        prog.push(Instruction::VFma { a: 11, b: 12, c: 10, d: 10 });
-    }
-    // Scale by 1/sqrt(head_dim).
-    prog.push(Instruction::VSplat { v: 11, scalar: inv_sqrt_d });
-    prog.push(Instruction::VMul { a: 10, b: 11, c: 10 });
-    // Apply additive mask (zero on valid lanes, -1e30 on padded).
-    prog.push(Instruction::LoadVec { v: 11, sram_addr: mask_addr });
-    prog.push(Instruction::VAdd { a: 10, b: 11, c: 10 });
-    // Spill masked scores so compile_softmax can pick them up.
-    prog.push(Instruction::StoreVec { v: 10, sram_addr: scores_addr });
+    // v15 = inv_sqrt_d broadcast (hoisted out of the per-chunk loop).
+    prog.push(Instruction::VSplat { v: 15, scalar: inv_sqrt_d });
 
-    // Phase B: in-place softmax on the score vector.
-    prog.extend(compile_softmax(seq_len, scores_addr));
-    // After softmax, reload scores into v10 (the lane-parallel weights).
-    prog.push(Instruction::LoadVec { v: 10, sram_addr: scores_addr });
-
-    // Phase C: out[d_chunk] = Σ_p scores[p] · V[p][d_chunk]. Each d_chunk is
-    // a 32-lane slice of `head_dim`. For each cached position p we broadcast
-    // lane p of the score vector and FMA into the running output accumulator.
-    for dc in 0..d_chunks {
-        prog.push(Instruction::VSplat { v: 13, scalar: 0.0 });    // v13 = out accumulator
-        for p in 0..seq_len {
-            prog.push(Instruction::VBroadcastLane { v_in: 10, v_out: 11, lane: p as u8 });
+    // Phase A: score chunks. For each position chunk pc, lane `lane` of
+    // v10 ends up holding (q · k_{pc*32 + lane}).
+    for pc in 0..n_p_chunks {
+        prog.push(Instruction::VSplat { v: 10, scalar: 0.0 });
+        for d in 0..head_dim {
+            prog.push(Instruction::LoadVec {
+                v: 11,
+                sram_addr: q_broadcast_addr + d * VECTOR_LANES,
+            });
             prog.push(Instruction::LoadVec {
                 v: 12,
-                sram_addr: v_addr + p * head_dim + dc * VECTOR_LANES,
+                sram_addr: k_t_addr + d * k_t_stride + pc * VECTOR_LANES,
             });
-            prog.push(Instruction::VFma { a: 11, b: 12, c: 13, d: 13 });
+            prog.push(Instruction::VFma { a: 11, b: 12, c: 10, d: 10 });
+        }
+        prog.push(Instruction::VMul { a: 10, b: 15, c: 10 });
+        prog.push(Instruction::LoadVec { v: 11, sram_addr: mask_addr + pc * VECTOR_LANES });
+        prog.push(Instruction::VAdd { a: 10, b: 11, c: 10 });
+        prog.push(Instruction::StoreVec { v: 10, sram_addr: scores_addr + pc * VECTOR_LANES });
+    }
+
+    // Phase B: in-place softmax over all score chunks.
+    prog.extend(compile_softmax(seq_len, scores_addr));
+
+    // Phase C: out[dc] = Σ_p scores[p] · V[p][dc]. We re-load the score
+    // chunk once per position chunk and inner-loop over the valid lanes.
+    for dc in 0..d_chunks {
+        prog.push(Instruction::VSplat { v: 13, scalar: 0.0 });
+        for pc in 0..n_p_chunks {
+            prog.push(Instruction::LoadVec {
+                v: 10,
+                sram_addr: scores_addr + pc * VECTOR_LANES,
+            });
+            let start = pc * VECTOR_LANES;
+            let end = ((pc + 1) * VECTOR_LANES).min(seq_len);
+            for p in start..end {
+                let lane = (p - start) as u8;
+                prog.push(Instruction::VBroadcastLane { v_in: 10, v_out: 11, lane });
+                prog.push(Instruction::LoadVec {
+                    v: 12,
+                    sram_addr: v_addr + p * head_dim + dc * VECTOR_LANES,
+                });
+                prog.push(Instruction::VFma { a: 11, b: 12, c: 13, d: 13 });
+            }
         }
         prog.push(Instruction::StoreVec { v: 13, sram_addr: out_addr + dc * VECTOR_LANES });
     }
@@ -988,7 +1023,7 @@ mod tests {
         let v_addr = k_addr + k_t.len();
         let m_addr = v_addr + v_cache.len();
         let s_addr = m_addr + mask.len();
-        let o_addr = s_addr + VECTOR_LANES;
+        let o_addr = s_addr + mask.len();   // scores buf is same shape as mask
         let sram_size = o_addr + head_dim;
         let mut acc = Accelerator::new(sram_size, 0);
         acc.sram[q_addr..q_addr + q_bcast.len()].copy_from_slice(&q_bcast);
@@ -1043,6 +1078,40 @@ mod tests {
             // Simulator.
             let out_sim = run_attention_head_on_sim(&q, &k_flat, &v_flat, seq_len, head_dim);
 
+            for d in 0..head_dim {
+                assert!(
+                    (out_sim[d] - out_cpu[d]).abs() < 1e-4,
+                    "seq_len={} lane {}: sim {} vs cpu {}",
+                    seq_len, d, out_sim[d], out_cpu[d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compile_attention_head_multi_chunk_seq_matches_cpu() {
+        use crate::attention::{attention, KvCache};
+        let head_dim = 64;
+        let n_heads = 1;
+        let n_kv_heads = 1;
+        let kv_dim = head_dim;
+
+        // Mix of clean multiples of 32 and partial last chunks across the range.
+        for (seq_len, seed) in [(33_usize, 401), (64, 403), (96, 405), (128, 409), (200, 411)] {
+            let q = pseudo(head_dim, seed);
+            let k_flat = pseudo(seq_len * head_dim, seed + 1);
+            let v_flat = pseudo(seq_len * head_dim, seed + 2);
+
+            let mut cache = KvCache::new(seq_len, kv_dim);
+            for p in 0..seq_len {
+                let row = &k_flat[p * head_dim..(p + 1) * head_dim];
+                let vrow = &v_flat[p * head_dim..(p + 1) * head_dim];
+                cache.store(p, row, vrow);
+            }
+            let mut out_cpu = vec![0.0_f32; head_dim];
+            attention(&q, &cache, seq_len - 1, n_heads, n_kv_heads, head_dim, &mut out_cpu);
+
+            let out_sim = run_attention_head_on_sim(&q, &k_flat, &v_flat, seq_len, head_dim);
             for d in 0..head_dim {
                 assert!(
                     (out_sim[d] - out_cpu[d]).abs() < 1e-4,
