@@ -523,6 +523,29 @@ pub fn compile_attention_head(
     prog
 }
 
+/// Expand a contiguous `n`-vector into the per-lane broadcast layout that
+/// attention reads: `out[d * VECTOR_LANES + lane] = src[d]` for every
+/// `lane ∈ [0, VECTOR_LANES)`. Used after a freshly-computed Q (or Q for a
+/// single head) lands in SRAM, before it can feed `compile_attention`.
+///
+/// Per 32-element chunk of source, this emits 1 LoadVec plus 32
+/// `(VBroadcastLane, StoreVec)` pairs — 65 instructions per chunk.
+/// `n` must be a multiple of `VECTOR_LANES`.
+pub fn compile_expand_to_broadcast(n: usize, src_addr: usize, dst_addr: usize) -> Vec<Instruction> {
+    assert_eq!(n % VECTOR_LANES, 0, "n must be a multiple of {}", VECTOR_LANES);
+    let n_chunks = n / VECTOR_LANES;
+    let mut prog = Vec::with_capacity(n_chunks * (1 + 2 * VECTOR_LANES));
+    for c in 0..n_chunks {
+        prog.push(Instruction::LoadVec { v: 0, sram_addr: src_addr + c * VECTOR_LANES });
+        for lane in 0..VECTOR_LANES {
+            prog.push(Instruction::VBroadcastLane { v_in: 0, v_out: 1, lane: lane as u8 });
+            let dst_off = (c * VECTOR_LANES + lane) * VECTOR_LANES;
+            prog.push(Instruction::StoreVec { v: 1, sram_addr: dst_addr + dst_off });
+        }
+    }
+    prog
+}
+
 /// Lower multi-head scaled dot-product attention with GQA support. Emits
 /// one `compile_attention_head` block per query head, mapping each Q head
 /// to its KV head via `kv_h = h / (n_heads / n_kv_heads)`.
@@ -647,6 +670,114 @@ pub fn split_v_per_kv_head(
         }
     }
     out
+}
+
+/// SRAM addresses for one Llama transformer block. The caller pre-allocates
+/// every region (weights and scratch) and `compile_llama_block` walks each
+/// sub-step in order — RMSNorm → Q proj → RoPE Q → attention → Wo → residual
+/// → RMSNorm → FFN → residual.
+///
+/// Caching: the K_T cache and V cache are populated *before* the block runs.
+/// This block does NOT scatter the current token's K, V into the cache —
+/// that's a job for a future ISA op (single-lane SRAM store). For the
+/// current-token integration test, the host computes K, V on the CPU side
+/// and stitches them in before calling `acc.run(&program)`.
+#[derive(Clone, Copy)]
+pub struct LlamaBlockLayout {
+    // Input + per-block norms (read-only)
+    pub x_addr: usize,            // [hidden]  — also receives final block output (residual in place)
+    pub attn_norm_addr: usize,    // [hidden]
+    pub ffn_norm_addr: usize,     // [hidden]
+
+    // Tiled weights (read-only) — produced by `retile_weight`
+    pub wq_addr: usize,           // [hidden, hidden]
+    pub wo_addr: usize,           // [hidden, hidden]
+    pub w_gate_addr: usize,       // [ffn_hidden, hidden]
+    pub w_up_addr: usize,         // [ffn_hidden, hidden]
+    pub w_down_addr: usize,       // [hidden, ffn_hidden]
+
+    // RoPE tables for the current position (read-only) — from `build_rope_tables`
+    pub rope_cos_addr: usize,     // [head_dim]
+    pub rope_sin_pm_addr: usize,  // [head_dim]
+
+    // Pre-populated K and V caches (read-only) — from `transpose_k_multihead`
+    // and `split_v_per_kv_head` over the cache including this token.
+    pub k_t_cache_addr: usize,    // [n_kv_heads * head_dim * n_p_chunks * 32]
+    pub v_cache_addr: usize,      // [n_kv_heads * seq_len * head_dim]
+    pub mask_addr: usize,         // [n_p_chunks * 32] — from `attention_mask`
+
+    // Scratch (written)
+    pub x_normed_addr: usize,     // [hidden]
+    pub q_addr: usize,            // [hidden]
+    pub q_broadcast_addr: usize,  // [n_heads * head_dim * 32]
+    pub attn_out_addr: usize,     // [hidden]
+    pub attn_proj_addr: usize,    // [hidden]
+    pub scores_scratch_addr: usize, // [n_p_chunks * 32]
+    pub gate_buf_addr: usize,     // [ffn_hidden]
+    pub up_buf_addr: usize,       // [ffn_hidden]
+    pub ffn_out_addr: usize,      // [hidden]
+}
+
+/// Lower one Llama transformer block (pre-norm variant) onto the simulator.
+/// See `LlamaBlockLayout` for the SRAM contract.
+pub fn compile_llama_block(
+    hidden: usize,
+    ffn_hidden: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_len: usize,
+    rms_eps: f32,
+    layout: LlamaBlockLayout,
+) -> Vec<Instruction> {
+    assert_eq!(hidden, n_heads * head_dim);
+    let mut prog = Vec::new();
+
+    // 1. x_normed = rmsnorm(x, attn_norm)
+    prog.extend(compile_rmsnorm(
+        hidden, rms_eps, layout.x_addr, layout.attn_norm_addr, layout.x_normed_addr,
+    ));
+    // 2. q = Wq @ x_normed
+    prog.extend(compile_linear(
+        hidden, hidden, layout.x_normed_addr, layout.wq_addr, layout.q_addr,
+    ));
+    // 3. RoPE Q in place
+    prog.extend(compile_rope(
+        hidden, head_dim, layout.q_addr, layout.rope_cos_addr, layout.rope_sin_pm_addr,
+    ));
+    // 4. Expand Q to per-lane broadcast layout for attention.
+    prog.extend(compile_expand_to_broadcast(
+        hidden, layout.q_addr, layout.q_broadcast_addr,
+    ));
+    // 5. attn_out = attention(q_broadcast, K_T_cache, V_cache)
+    prog.extend(compile_attention(
+        n_heads, n_kv_heads, head_dim, seq_len,
+        layout.q_broadcast_addr, layout.k_t_cache_addr, layout.v_cache_addr,
+        layout.mask_addr, layout.scores_scratch_addr, layout.attn_out_addr,
+    ));
+    // 6. attn_proj = Wo @ attn_out
+    prog.extend(compile_linear(
+        hidden, hidden, layout.attn_out_addr, layout.wo_addr, layout.attn_proj_addr,
+    ));
+    // 7. x += attn_proj (residual, in place)
+    prog.extend(compile_add(
+        hidden, layout.x_addr, layout.attn_proj_addr, layout.x_addr,
+    ));
+    // 8. x_normed = rmsnorm(x, ffn_norm)  — reuse x_normed scratch
+    prog.extend(compile_rmsnorm(
+        hidden, rms_eps, layout.x_addr, layout.ffn_norm_addr, layout.x_normed_addr,
+    ));
+    // 9. ffn_out = FFN(x_normed)
+    prog.extend(compile_ffn(
+        hidden, ffn_hidden,
+        layout.x_normed_addr, layout.w_gate_addr, layout.w_up_addr, layout.w_down_addr,
+        layout.gate_buf_addr, layout.up_buf_addr, layout.ffn_out_addr,
+    ));
+    // 10. x += ffn_out (residual, in place)
+    prog.extend(compile_add(
+        hidden, layout.x_addr, layout.ffn_out_addr, layout.x_addr,
+    ));
+    prog
 }
 
 /// Re-layout a row-major `[out_dim, in_dim]` weight matrix into the tiled
@@ -1374,6 +1505,195 @@ mod tests {
         let sim = run_attention_head_on_sim(&q, &k, &v, seq_len, head_dim);
         for &val in &sim {
             assert!((val - 9.0).abs() < 1e-3, "got {}", val);
+        }
+    }
+
+    // ===== Chapter 5.8e: full Llama block on the simulator =====
+
+    #[test]
+    fn compile_expand_to_broadcast_lays_out_correctly() {
+        let n = 64;
+        let src: Vec<f32> = (0..n).map(|i| i as f32 + 1.0).collect();
+        let sram_size = n + n * VECTOR_LANES;
+        let mut acc = Accelerator::new(sram_size, 0);
+        acc.sram[..n].copy_from_slice(&src);
+        let prog = compile_expand_to_broadcast(n, 0, n);
+        acc.run(&prog).unwrap();
+        for d in 0..n {
+            for lane in 0..VECTOR_LANES {
+                let got = acc.sram[n + d * VECTOR_LANES + lane];
+                assert_eq!(got, src[d], "d={} lane={}", d, lane);
+            }
+        }
+    }
+
+    #[test]
+    fn end_to_end_llama_block_matches_cpu() {
+        use crate::attention::{attention, KvCache};
+        use crate::nn::{linear, rmsnorm, rope_heads};
+
+        // Small synthetic config that still exercises:
+        //   - GQA (q_per_kv = 2)
+        //   - multi-position cache (seq_len = 4, cur_pos = 3 with prior history)
+        //   - all block primitives at non-trivial sizes
+        let hidden = 64;
+        let head_dim = 32;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let ffn_hidden = 64;
+        let seq_len = 4;
+        let cur_pos = seq_len - 1;
+        let rms_eps = 1e-5_f32;
+        let freq_base = 10000.0_f32;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let x = pseudo(hidden, 701);
+        let attn_norm = pseudo(hidden, 703);
+        let ffn_norm = pseudo(hidden, 707);
+        let wq = pseudo(hidden * hidden, 709);
+        let wk = pseudo(kv_dim * hidden, 711);
+        let wv = pseudo(kv_dim * hidden, 713);
+        let wo = pseudo(hidden * hidden, 715);
+        let w_gate = pseudo(ffn_hidden * hidden, 717);
+        let w_up = pseudo(ffn_hidden * hidden, 719);
+        let w_down = pseudo(hidden * ffn_hidden, 721);
+
+        // Prior-position cache contents (positions 0..cur_pos). Stand in for
+        // what earlier tokens' forward passes would have written. The sim and
+        // CPU both consume the same random buffer, so attention math agrees.
+        let prior_k = pseudo(cur_pos * kv_dim, 801);
+        let prior_v = pseudo(cur_pos * kv_dim, 803);
+
+        // ===== CPU oracle =====
+        let mut x_cpu = x.clone();
+        let mut x_normed_1 = vec![0.0_f32; hidden];
+        rmsnorm(&x_cpu, &attn_norm, rms_eps, &mut x_normed_1);
+        let mut q_cpu = vec![0.0_f32; hidden];
+        let mut k_cpu = vec![0.0_f32; kv_dim];
+        let mut v_cpu = vec![0.0_f32; kv_dim];
+        linear(&x_normed_1, &wq, &mut q_cpu);
+        linear(&x_normed_1, &wk, &mut k_cpu);
+        linear(&x_normed_1, &wv, &mut v_cpu);
+        rope_heads(&mut q_cpu, head_dim, cur_pos, freq_base);
+        rope_heads(&mut k_cpu, head_dim, cur_pos, freq_base);
+
+        let mut cache = KvCache::new(seq_len, kv_dim);
+        for p in 0..cur_pos {
+            cache.store(p,
+                &prior_k[p * kv_dim..(p + 1) * kv_dim],
+                &prior_v[p * kv_dim..(p + 1) * kv_dim]);
+        }
+        cache.store(cur_pos, &k_cpu, &v_cpu);
+
+        let mut attn_out_cpu = vec![0.0_f32; hidden];
+        attention(&q_cpu, &cache, cur_pos, n_heads, n_kv_heads, head_dim, &mut attn_out_cpu);
+        let mut attn_proj_cpu = vec![0.0_f32; hidden];
+        linear(&attn_out_cpu, &wo, &mut attn_proj_cpu);
+        for i in 0..hidden {
+            x_cpu[i] += attn_proj_cpu[i];
+        }
+        let mut x_normed_2 = vec![0.0_f32; hidden];
+        rmsnorm(&x_cpu, &ffn_norm, rms_eps, &mut x_normed_2);
+        // FFN: down @ (silu(gate @ x_normed) ⊙ (up @ x_normed))
+        let mut g = vec![0.0_f32; ffn_hidden];
+        let mut u = vec![0.0_f32; ffn_hidden];
+        linear(&x_normed_2, &w_gate, &mut g);
+        linear(&x_normed_2, &w_up, &mut u);
+        for i in 0..ffn_hidden {
+            let s = g[i] / (1.0 + (-g[i]).exp());
+            g[i] = s * u[i];
+        }
+        let mut ffn_out_cpu = vec![0.0_f32; hidden];
+        linear(&g, &w_down, &mut ffn_out_cpu);
+        for i in 0..hidden {
+            x_cpu[i] += ffn_out_cpu[i];
+        }
+
+        // ===== Simulator path =====
+        // Cache layouts (post-RoPE K already in there).
+        let mut k_flat = vec![0.0_f32; seq_len * kv_dim];
+        let mut v_flat = vec![0.0_f32; seq_len * kv_dim];
+        for p in 0..cur_pos {
+            k_flat[p * kv_dim..(p + 1) * kv_dim]
+                .copy_from_slice(&prior_k[p * kv_dim..(p + 1) * kv_dim]);
+            v_flat[p * kv_dim..(p + 1) * kv_dim]
+                .copy_from_slice(&prior_v[p * kv_dim..(p + 1) * kv_dim]);
+        }
+        k_flat[cur_pos * kv_dim..(cur_pos + 1) * kv_dim].copy_from_slice(&k_cpu);
+        v_flat[cur_pos * kv_dim..(cur_pos + 1) * kv_dim].copy_from_slice(&v_cpu);
+        let k_t = transpose_k_multihead(&k_flat, seq_len, n_kv_heads, head_dim);
+        let v_split = split_v_per_kv_head(&v_flat, seq_len, n_kv_heads, head_dim);
+        let mask = attention_mask(seq_len);
+        let (rope_cos, rope_sin_pm) = build_rope_tables(head_dim, cur_pos, freq_base);
+        let wq_tiled = retile_weight(&wq, hidden, hidden);
+        let wo_tiled = retile_weight(&wo, hidden, hidden);
+        let w_gate_tiled = retile_weight(&w_gate, hidden, ffn_hidden);
+        let w_up_tiled = retile_weight(&w_up, hidden, ffn_hidden);
+        let w_down_tiled = retile_weight(&w_down, ffn_hidden, hidden);
+
+        // SRAM allocator.
+        let mut size = 0usize;
+        let mut alloc = |n: usize| -> usize { let off = size; size += n; off };
+        let x_addr = alloc(hidden);
+        let attn_norm_addr = alloc(hidden);
+        let ffn_norm_addr = alloc(hidden);
+        let wq_addr = alloc(hidden * hidden);
+        let wo_addr = alloc(hidden * hidden);
+        let w_gate_addr = alloc(hidden * ffn_hidden);
+        let w_up_addr = alloc(hidden * ffn_hidden);
+        let w_down_addr = alloc(hidden * ffn_hidden);
+        let rope_cos_addr = alloc(head_dim);
+        let rope_sin_pm_addr = alloc(head_dim);
+        let k_t_cache_addr = alloc(k_t.len());
+        let v_cache_addr = alloc(v_split.len());
+        let mask_addr = alloc(mask.len());
+        let x_normed_addr = alloc(hidden);
+        let q_addr = alloc(hidden);
+        let q_broadcast_addr = alloc(n_heads * head_dim * VECTOR_LANES);
+        let attn_out_addr = alloc(hidden);
+        let attn_proj_addr = alloc(hidden);
+        let scores_scratch_addr = alloc(mask.len());
+        let gate_buf_addr = alloc(ffn_hidden);
+        let up_buf_addr = alloc(ffn_hidden);
+        let ffn_out_addr = alloc(hidden);
+
+        let mut acc = Accelerator::new(size, 0);
+        acc.sram[x_addr..x_addr + hidden].copy_from_slice(&x);
+        acc.sram[attn_norm_addr..attn_norm_addr + hidden].copy_from_slice(&attn_norm);
+        acc.sram[ffn_norm_addr..ffn_norm_addr + hidden].copy_from_slice(&ffn_norm);
+        acc.sram[wq_addr..wq_addr + hidden * hidden].copy_from_slice(&wq_tiled);
+        acc.sram[wo_addr..wo_addr + hidden * hidden].copy_from_slice(&wo_tiled);
+        acc.sram[w_gate_addr..w_gate_addr + hidden * ffn_hidden].copy_from_slice(&w_gate_tiled);
+        acc.sram[w_up_addr..w_up_addr + hidden * ffn_hidden].copy_from_slice(&w_up_tiled);
+        acc.sram[w_down_addr..w_down_addr + hidden * ffn_hidden].copy_from_slice(&w_down_tiled);
+        acc.sram[rope_cos_addr..rope_cos_addr + head_dim].copy_from_slice(&rope_cos);
+        acc.sram[rope_sin_pm_addr..rope_sin_pm_addr + head_dim].copy_from_slice(&rope_sin_pm);
+        acc.sram[k_t_cache_addr..k_t_cache_addr + k_t.len()].copy_from_slice(&k_t);
+        acc.sram[v_cache_addr..v_cache_addr + v_split.len()].copy_from_slice(&v_split);
+        acc.sram[mask_addr..mask_addr + mask.len()].copy_from_slice(&mask);
+
+        let layout = LlamaBlockLayout {
+            x_addr, attn_norm_addr, ffn_norm_addr,
+            wq_addr, wo_addr, w_gate_addr, w_up_addr, w_down_addr,
+            rope_cos_addr, rope_sin_pm_addr,
+            k_t_cache_addr, v_cache_addr, mask_addr,
+            x_normed_addr, q_addr, q_broadcast_addr,
+            attn_out_addr, attn_proj_addr, scores_scratch_addr,
+            gate_buf_addr, up_buf_addr, ffn_out_addr,
+        };
+        let prog = compile_llama_block(
+            hidden, ffn_hidden, head_dim, n_heads, n_kv_heads,
+            seq_len, rms_eps, layout,
+        );
+        acc.run(&prog).unwrap();
+
+        for i in 0..hidden {
+            let got = acc.sram[x_addr + i];
+            let want = x_cpu[i];
+            assert!(
+                (got - want).abs() < 1e-3,
+                "x[{}]: sim {} vs cpu {} (diff {})", i, got, want, (got - want).abs()
+            );
         }
     }
 
