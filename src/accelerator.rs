@@ -87,6 +87,18 @@ pub enum Instruction {
     /// in silicon (NEON `vrev64`, AVX `vpshufd`). Needed for interleaved-pair
     /// RoPE, where the cross-term in the 2D rotation pulls the swapped vector.
     VSwapPairs { v_in: u8, v_out: u8 },
+    /// `vregs[v_out] = exp(vregs[v_in])` (lanewise). Transcendental — same
+    /// design point as VSilu / VRsqrt. The softmax kernel needs it.
+    VExp { v_in: u8, v_out: u8 },
+    /// `vregs[v_out] = [max(vregs[v_in]); VECTOR_LANES]` — broadcast the
+    /// max across lanes. Companion of VReduceSum; required for the
+    /// numerically-stable softmax (subtract-max trick).
+    VReduceMax { v_in: u8, v_out: u8 },
+    /// `vregs[v_out] = [vregs[v_in][lane]; VECTOR_LANES]` — broadcast one
+    /// lane to all lanes. Standard shuffle (NEON `vdup_lane_f32`, AVX
+    /// `_mm256_set1_ps`). Lets the attention kernel feed per-position
+    /// softmax weights into the weighted-V accumulation.
+    VBroadcastLane { v_in: u8, v_out: u8, lane: u8 },
 
     // === Matrix unit (chapter 5.1) ===
     /// Zero the matrix accumulator.
@@ -201,6 +213,27 @@ impl Accelerator {
                     self.vregs[o][2 * k] = src[2 * k + 1];
                     self.vregs[o][2 * k + 1] = src[2 * k];
                 }
+            }
+            VExp { v_in, v_out } => {
+                let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
+                let src = self.vregs[i];
+                for k in 0..VECTOR_LANES {
+                    self.vregs[o][k] = src[k].exp();
+                }
+            }
+            VReduceMax { v_in, v_out } => {
+                let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
+                let m = self.vregs[i].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                self.vregs[o] = [m; VECTOR_LANES];
+            }
+            VBroadcastLane { v_in, v_out, lane } => {
+                let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
+                let l = lane as usize;
+                if l >= VECTOR_LANES {
+                    bail!("VBroadcastLane lane {} out of range (have {})", l, VECTOR_LANES);
+                }
+                let scalar = self.vregs[i][l];
+                self.vregs[o] = [scalar; VECTOR_LANES];
             }
 
             // --- Matrix unit ---
@@ -379,6 +412,52 @@ mod tests {
             assert_eq!(acc.vregs[1][2 * k], (2 * k + 1) as f32);
             assert_eq!(acc.vregs[1][2 * k + 1], (2 * k) as f32);
         }
+    }
+
+    #[test]
+    fn vexp_lanewise_matches_libm() {
+        let mut acc = new_acc(64);
+        for (lane, &v) in [-1.0_f32, 0.0, 1.0, 2.0].iter().enumerate() {
+            acc.vregs[0][lane] = v;
+        }
+        acc.execute(&Instruction::VExp { v_in: 0, v_out: 1 }).unwrap();
+        for (lane, &v) in [-1.0_f32, 0.0, 1.0, 2.0].iter().enumerate() {
+            let expected = v.exp();
+            assert!((acc.vregs[1][lane] - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn vreduce_max_broadcasts_max_to_all_lanes() {
+        let mut acc = new_acc(64);
+        for k in 0..VECTOR_LANES {
+            acc.vregs[0][k] = k as f32; // max = 31
+        }
+        acc.vregs[0][7] = 100.0;
+        acc.execute(&Instruction::VReduceMax { v_in: 0, v_out: 1 }).unwrap();
+        for k in 0..VECTOR_LANES {
+            assert_eq!(acc.vregs[1][k], 100.0);
+        }
+    }
+
+    #[test]
+    fn vbroadcast_lane_copies_one_lane_everywhere() {
+        let mut acc = new_acc(64);
+        for k in 0..VECTOR_LANES {
+            acc.vregs[0][k] = (k as f32) * 0.5;
+        }
+        acc.execute(&Instruction::VBroadcastLane { v_in: 0, v_out: 1, lane: 5 }).unwrap();
+        for k in 0..VECTOR_LANES {
+            assert_eq!(acc.vregs[1][k], 2.5);
+        }
+    }
+
+    #[test]
+    fn vbroadcast_lane_out_of_range_errors() {
+        let mut acc = new_acc(64);
+        assert!(acc
+            .execute(&Instruction::VBroadcastLane { v_in: 0, v_out: 1, lane: 32 })
+            .is_err());
     }
 
     #[test]
