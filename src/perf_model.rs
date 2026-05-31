@@ -28,7 +28,7 @@ pub fn cycle_cost(instr: &Instruction) -> u64 {
         LoadVec { .. } | StoreVec { .. } => 1,
         // Simple vector arithmetic + lane shuffle — 1 cycle on a vector pipe.
         VAdd { .. } | VMul { .. } | VFma { .. } | VSplat { .. }
-        | VSwapPairs { .. } | VBroadcastLane { .. } => 1,
+        | VSwapPairs { .. } | VBroadcastLane { .. } | VMax { .. } => 1,
         // Horizontal reductions via log-tree network. log2(32)=5 levels of
         // pairwise op, but real designs pipeline this to ~4 cycles.
         VReduceSum { .. } | VReduceMax { .. } => 4,
@@ -102,6 +102,7 @@ mod tests {
             cycle_cost(&Instruction::VBroadcastLane { v_in: 0, v_out: 0, lane: 0 }),
             1
         );
+        assert_eq!(cycle_cost(&Instruction::VMax { a: 0, b: 0, c: 0 }), 1);
         assert_eq!(
             cycle_cost(&Instruction::MatVecTile { x_sram: 0, w_sram: 0, y_sram: 0, accumulate: false }),
             16

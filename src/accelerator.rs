@@ -94,6 +94,10 @@ pub enum Instruction {
     /// max across lanes. Companion of VReduceSum; required for the
     /// numerically-stable softmax (subtract-max trick).
     VReduceMax { v_in: u8, v_out: u8 },
+    /// `vregs[c] = max(vregs[a], vregs[b])` (lanewise). Used by the
+    /// multi-chunk softmax kernel to merge per-chunk max-broadcasts into a
+    /// running global max across chunks.
+    VMax { a: u8, b: u8, c: u8 },
     /// `vregs[v_out] = [vregs[v_in][lane]; VECTOR_LANES]` — broadcast one
     /// lane to all lanes. Standard shuffle (NEON `vdup_lane_f32`, AVX
     /// `_mm256_set1_ps`). Lets the attention kernel feed per-position
@@ -225,6 +229,18 @@ impl Accelerator {
                 let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
                 let m = self.vregs[i].iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 self.vregs[o] = [m; VECTOR_LANES];
+            }
+            VMax { a, b, c } => {
+                let (a, b, c) = (
+                    idx(a, N_VECTOR_REGS, "vreg")?,
+                    idx(b, N_VECTOR_REGS, "vreg")?,
+                    idx(c, N_VECTOR_REGS, "vreg")?,
+                );
+                let va = self.vregs[a];
+                let vb = self.vregs[b];
+                for i in 0..VECTOR_LANES {
+                    self.vregs[c][i] = va[i].max(vb[i]);
+                }
             }
             VBroadcastLane { v_in, v_out, lane } => {
                 let (i, o) = (idx(v_in, N_VECTOR_REGS, "vreg")?, idx(v_out, N_VECTOR_REGS, "vreg")?);
@@ -449,6 +465,20 @@ mod tests {
         acc.execute(&Instruction::VBroadcastLane { v_in: 0, v_out: 1, lane: 5 }).unwrap();
         for k in 0..VECTOR_LANES {
             assert_eq!(acc.vregs[1][k], 2.5);
+        }
+    }
+
+    #[test]
+    fn vmax_lanewise_is_pointwise_max() {
+        let mut acc = new_acc(64);
+        for k in 0..VECTOR_LANES {
+            acc.vregs[0][k] = k as f32;
+            acc.vregs[1][k] = (VECTOR_LANES as f32) - (k as f32);
+        }
+        acc.execute(&Instruction::VMax { a: 0, b: 1, c: 2 }).unwrap();
+        for k in 0..VECTOR_LANES {
+            let expected = (k as f32).max((VECTOR_LANES as f32) - (k as f32));
+            assert_eq!(acc.vregs[2][k], expected);
         }
     }
 
