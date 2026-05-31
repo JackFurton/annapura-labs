@@ -523,6 +523,132 @@ pub fn compile_attention_head(
     prog
 }
 
+/// Lower multi-head scaled dot-product attention with GQA support. Emits
+/// one `compile_attention_head` block per query head, mapping each Q head
+/// to its KV head via `kv_h = h / (n_heads / n_kv_heads)`.
+///
+/// SRAM contract (concatenated blocks):
+///   - `q_broadcast_addr`: `n_heads * head_dim * VECTOR_LANES`
+///     (one `broadcast_q` per head — use `broadcast_q_multihead`)
+///   - `k_t_cache_addr`:  `n_kv_heads * head_dim * n_p_chunks * VECTOR_LANES`
+///     (one `transpose_k_for_lanes` per KV head — use `transpose_k_multihead`)
+///   - `v_cache_addr`:    `n_kv_heads * seq_len * head_dim`
+///     (per-KV-head split — use `split_v_per_kv_head`)
+///   - `mask_addr`:       `n_p_chunks * VECTOR_LANES` (shared across heads)
+///   - `scores_scratch_addr`: `n_p_chunks * VECTOR_LANES` (shared scratch)
+///   - `out_addr`:        `n_heads * head_dim` (per-head outputs concatenated)
+#[allow(clippy::too_many_arguments)]
+pub fn compile_attention(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    q_broadcast_addr: usize,
+    k_t_cache_addr: usize,
+    v_cache_addr: usize,
+    mask_addr: usize,
+    scores_scratch_addr: usize,
+    out_addr: usize,
+) -> Vec<Instruction> {
+    assert_eq!(n_heads % n_kv_heads, 0, "n_heads must be a multiple of n_kv_heads");
+    assert!(seq_len > 0);
+    let q_per_kv = n_heads / n_kv_heads;
+    let n_p_chunks = seq_len.div_ceil(VECTOR_LANES);
+    let q_block = head_dim * VECTOR_LANES;
+    let k_t_block = head_dim * n_p_chunks * VECTOR_LANES;
+    let v_block = seq_len * head_dim;
+    let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
+
+    let mut prog = Vec::new();
+    for h in 0..n_heads {
+        let kv_h = h / q_per_kv;
+        prog.extend(compile_attention_head(
+            head_dim, seq_len,
+            q_broadcast_addr + h * q_block,
+            k_t_cache_addr + kv_h * k_t_block,
+            v_cache_addr + kv_h * v_block,
+            mask_addr,
+            scores_scratch_addr,
+            out_addr + h * head_dim,
+            inv_sqrt_d,
+        ));
+    }
+    prog
+}
+
+/// Concatenated per-head broadcast: for each query head `h`, the head's
+/// slice of `q` is expanded via `broadcast_q` into `head_dim * VECTOR_LANES`
+/// floats. Output length: `n_heads * head_dim * VECTOR_LANES`.
+pub fn broadcast_q_multihead(q: &[f32], n_heads: usize, head_dim: usize) -> Vec<f32> {
+    assert_eq!(q.len(), n_heads * head_dim);
+    let per_head = head_dim * VECTOR_LANES;
+    let mut out = vec![0.0_f32; n_heads * per_head];
+    for h in 0..n_heads {
+        let q_h = &q[h * head_dim..(h + 1) * head_dim];
+        for (d, &v) in q_h.iter().enumerate() {
+            let base = h * per_head + d * VECTOR_LANES;
+            for lane in 0..VECTOR_LANES {
+                out[base + lane] = v;
+            }
+        }
+    }
+    out
+}
+
+/// Per-KV-head K transpose for `compile_attention`. Source `k` is the
+/// standard cache layout `[seq_len, n_kv_heads * head_dim]` (one row per
+/// position, same as `KvCache.k`). Output concatenates one
+/// `transpose_k_for_lanes` block per KV head, giving total length
+/// `n_kv_heads * head_dim * n_p_chunks * VECTOR_LANES`.
+pub fn transpose_k_multihead(
+    k: &[f32],
+    seq_len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let kv_dim = n_kv_heads * head_dim;
+    assert_eq!(k.len(), seq_len * kv_dim);
+    let n_p_chunks = seq_len.div_ceil(VECTOR_LANES);
+    let per_head = head_dim * n_p_chunks * VECTOR_LANES;
+    let stride = n_p_chunks * VECTOR_LANES;
+    let mut out = vec![0.0_f32; n_kv_heads * per_head];
+    for kv_h in 0..n_kv_heads {
+        for p in 0..seq_len {
+            let pc = p / VECTOR_LANES;
+            let lane = p % VECTOR_LANES;
+            let src_row = &k[p * kv_dim + kv_h * head_dim..p * kv_dim + (kv_h + 1) * head_dim];
+            for (d, &v) in src_row.iter().enumerate() {
+                out[kv_h * per_head + d * stride + pc * VECTOR_LANES + lane] = v;
+            }
+        }
+    }
+    out
+}
+
+/// Per-KV-head V split. Source `v` is `[seq_len, n_kv_heads * head_dim]`
+/// (the standard `KvCache.v` layout). Output concatenates one
+/// `[seq_len, head_dim]` block per KV head — what `compile_attention_head`
+/// reads as its V cache.
+pub fn split_v_per_kv_head(
+    v: &[f32],
+    seq_len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let kv_dim = n_kv_heads * head_dim;
+    assert_eq!(v.len(), seq_len * kv_dim);
+    let per_head = seq_len * head_dim;
+    let mut out = vec![0.0_f32; n_kv_heads * per_head];
+    for kv_h in 0..n_kv_heads {
+        for p in 0..seq_len {
+            let src = &v[p * kv_dim + kv_h * head_dim..p * kv_dim + (kv_h + 1) * head_dim];
+            let dst_off = kv_h * per_head + p * head_dim;
+            out[dst_off..dst_off + head_dim].copy_from_slice(src);
+        }
+    }
+    out
+}
+
 /// Re-layout a row-major `[out_dim, in_dim]` weight matrix into the tiled
 /// layout expected by `compile_linear` / `MatVecTile`.
 ///
@@ -1119,6 +1245,115 @@ mod tests {
                     seq_len, d, out_sim[d], out_cpu[d]
                 );
             }
+        }
+    }
+
+    // ===== Chapter 5.8d: multi-head wrapper + GQA =====
+
+    fn run_attention_multihead_on_sim(
+        q: &[f32],            // n_heads * head_dim
+        k_cache: &[f32],      // [seq_len, n_kv_heads * head_dim] row major
+        v_cache: &[f32],      // [seq_len, n_kv_heads * head_dim] row major
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Vec<f32> {
+        let q_bcast = broadcast_q_multihead(q, n_heads, head_dim);
+        let k_t = transpose_k_multihead(k_cache, seq_len, n_kv_heads, head_dim);
+        let v_split = split_v_per_kv_head(v_cache, seq_len, n_kv_heads, head_dim);
+        let mask = attention_mask(seq_len);
+
+        // SRAM layout: q_bcast | k_t | v_split | mask | scores_scratch | out
+        let q_addr = 0;
+        let k_addr = q_addr + q_bcast.len();
+        let v_addr = k_addr + k_t.len();
+        let m_addr = v_addr + v_split.len();
+        let s_addr = m_addr + mask.len();
+        let o_addr = s_addr + mask.len();
+        let sram_size = o_addr + n_heads * head_dim;
+        let mut acc = Accelerator::new(sram_size, 0);
+        acc.sram[q_addr..q_addr + q_bcast.len()].copy_from_slice(&q_bcast);
+        acc.sram[k_addr..k_addr + k_t.len()].copy_from_slice(&k_t);
+        acc.sram[v_addr..v_addr + v_split.len()].copy_from_slice(&v_split);
+        acc.sram[m_addr..m_addr + mask.len()].copy_from_slice(&mask);
+
+        let prog = compile_attention(
+            n_heads, n_kv_heads, head_dim, seq_len,
+            q_addr, k_addr, v_addr, m_addr, s_addr, o_addr,
+        );
+        acc.run(&prog).unwrap();
+        acc.sram[o_addr..o_addr + n_heads * head_dim].to_vec()
+    }
+
+    #[test]
+    fn compile_attention_mha_matches_cpu() {
+        // Plain multi-head (no GQA): n_heads == n_kv_heads.
+        use crate::attention::{attention, KvCache};
+        let head_dim = 32;
+        let n_heads = 2;
+        let n_kv_heads = 2;
+        let seq_len = 4;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q = pseudo(n_heads * head_dim, 501);
+        let k_cache = pseudo(seq_len * kv_dim, 503);
+        let v_cache = pseudo(seq_len * kv_dim, 505);
+
+        let mut cache = KvCache::new(seq_len, kv_dim);
+        for p in 0..seq_len {
+            let kr = &k_cache[p * kv_dim..(p + 1) * kv_dim];
+            let vr = &v_cache[p * kv_dim..(p + 1) * kv_dim];
+            cache.store(p, kr, vr);
+        }
+        let mut out_cpu = vec![0.0_f32; n_heads * head_dim];
+        attention(&q, &cache, seq_len - 1, n_heads, n_kv_heads, head_dim, &mut out_cpu);
+
+        let out_sim = run_attention_multihead_on_sim(
+            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, seq_len,
+        );
+        for d in 0..n_heads * head_dim {
+            assert!(
+                (out_sim[d] - out_cpu[d]).abs() < 1e-4,
+                "lane {}: sim {} vs cpu {}",
+                d, out_sim[d], out_cpu[d]
+            );
+        }
+    }
+
+    #[test]
+    fn compile_attention_gqa_matches_cpu() {
+        // GQA: 4 query heads sharing 2 KV heads (q_per_kv = 2). Multi-chunk
+        // seq_len to exercise both wrappers at once.
+        use crate::attention::{attention, KvCache};
+        let head_dim = 64;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let seq_len = 40; // 2 position chunks, last is partial
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q = pseudo(n_heads * head_dim, 601);
+        let k_cache = pseudo(seq_len * kv_dim, 603);
+        let v_cache = pseudo(seq_len * kv_dim, 607);
+
+        let mut cache = KvCache::new(seq_len, kv_dim);
+        for p in 0..seq_len {
+            let kr = &k_cache[p * kv_dim..(p + 1) * kv_dim];
+            let vr = &v_cache[p * kv_dim..(p + 1) * kv_dim];
+            cache.store(p, kr, vr);
+        }
+        let mut out_cpu = vec![0.0_f32; n_heads * head_dim];
+        attention(&q, &cache, seq_len - 1, n_heads, n_kv_heads, head_dim, &mut out_cpu);
+
+        let out_sim = run_attention_multihead_on_sim(
+            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, seq_len,
+        );
+        for d in 0..n_heads * head_dim {
+            assert!(
+                (out_sim[d] - out_cpu[d]).abs() < 1e-4,
+                "lane {}: sim {} vs cpu {}",
+                d, out_sim[d], out_cpu[d]
+            );
         }
     }
 
